@@ -227,6 +227,15 @@ class Shot:
     def on_target_duration_s(self) -> float:
         return self.trace.on_target_duration_s() if self.trace else 0.0
 
+    @property
+    def clock_position(self) -> int:
+        """Clock position (1-12) where 12 is top, 3 is right, etc."""
+        x, y = self.aim_mm
+        angle = math.degrees(math.atan2(-y, x))  # Invert y for correct orientation
+        clock_angle = (90 - angle) % 360
+        clock_hour = int(round(clock_angle / 30)) % 12
+        return 12 if clock_hour == 0 else clock_hour
+
 
 # ── Live CSV writer ───────────────────────────────────────────────────────────
 

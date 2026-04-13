@@ -3,3 +3,4 @@ opencv-python>=4.7
 sounddevice>=0.4.6
 Pillow>=9.0
 scipy>=1.9
+pyttsx3>=2.99

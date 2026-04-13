@@ -30,6 +30,9 @@ from core.target_renderer import TargetRenderer
 from core.marker_sheet import generate_marker_sheet
 from core.smoother import make_smoother
 
+# - Added by RP: Text-to-speech for audio feedback on scoring. Optional dependency.
+import pyttsx3
+
 # ── Palette ───────────────────────────────────────────────────────────────────
 BG_DARK  = "#0f0f13"
 BG_MID   = "#16161d"
@@ -840,6 +843,12 @@ class SplattApp:
         shot.score      = score
         shot.ring_index = ring
         shot.mark_index = mark_idx
+
+        def _speek():
+            pyttsx3.speak(f"{score:.1f}, {shot.clock_position} o'clock" if self._decimal_scoring else f"{int(score)} at {shot.clock_position} o'clock")
+
+        if self.cfg.get("voice_enabled", True):
+            threading.Thread(target=_speek).start()
 
         # Step 4: rewrite the live CSV row with the correct score
         if self.session._writer and self.session._writer.is_open:
@@ -3126,6 +3135,12 @@ class SettingsDialog(tk.Toplevel):
         self._note(tab, "Session name is used for saved file names.")
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
 
+        self._section(tab, "Voice Feedback")
+        self._voice_enabled = tk.BooleanVar(value=self.cfg.get("voice_enabled", False))
+        self._row(tab, "Voice enabled",
+                  lambda p: tk.Checkbutton(p, variable=self._voice_enabled,
+                                           bg=BG_DARK, selectcolor=BG_CARD))
+
     def _collect(self):
         for attr in dir(self):
             if attr.startswith("_v_"):
@@ -3153,6 +3168,8 @@ class SettingsDialog(tk.Toplevel):
             self.cfg["use_clahe"] = self._clahe_var.get()
         if hasattr(self, "_im_var"):
             self.cfg["ignore_misses"] = self._im_var.get()
+        if hasattr(self, "_voice_enabled"):
+            self.cfg["voice_enabled"] = self._voice_enabled.get()
 
     def _apply(self):
         self._collect()

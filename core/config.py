@@ -226,6 +226,9 @@ DEFAULT_CONFIG = {
     "shooter_name":       "",
     "shots_per_series":   10,
     "save_directory":     "",    # empty = sessions/ folder next to the app
+
+    # ── Voice feedback ───────────────────────────────────────────────────────
+    "voice_enabled":      True, # speak scores aloud
 }
 
 
