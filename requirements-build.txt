@@ -1,0 +1,5 @@
+# Build-time dependencies for packaging Splatt2.
+# Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-build.txt
+
+pyinstaller>=6.20
