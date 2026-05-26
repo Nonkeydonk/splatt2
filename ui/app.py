@@ -22,10 +22,14 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from core.audio import AudioDetector
-from core.config import TARGETS, VERSION, load_config, save_config
-from core.marker_sheet import generate_marker_sheet
-from core.session import (Session, Shot, ShotTrace,
-                          load_session_history, reconstruct_shot_traces)
+from core.config import (TARGETS, VERSION, _load_target_csv, _targets_dir,
+                          _user_targets_dir, load_all_targets, load_config,
+                          save_config)
+from core.marker_sheet import (A4_W_MM, AIMING_MARKS, _get_aiming_marks,
+                                generate_marker_sheet)
+from core.session import (APPROACH_ZONE_FACTOR, Session, Shot, ShotTrace,
+                          TracePoint, load_session_history,
+                          reconstruct_shot_traces)
 from core.smoother import make_smoother
 from core.target_renderer import TargetRenderer
 from core.tracker import ArucoTracker, score_shot
@@ -1413,7 +1417,6 @@ class SplattApp:
             self.cfg.get("fading_trace_duration_s", 2.0))
         self.session.acp_fraction = float(
             self.cfg.get("acp_fraction", 0.40))
-        from core.session import APPROACH_ZONE_FACTOR
         factor = float(self.cfg.get("approach_zone_factor",
                                      APPROACH_ZONE_FACTOR))
         R = self._scoring_radius_mm()
@@ -1753,7 +1756,6 @@ class SplattApp:
 
     def _show_first_run_wizard(self):
         """Simple first-run setup wizard shown when no config file exists."""
-        from core.config import TARGETS, save_config
         dlg = tk.Toplevel(self.root)
         dlg.title("Welcome to Splatt2!")
         dlg.configure(bg=BG_DARK)
@@ -1843,7 +1845,6 @@ class MarkerSheetDialog(tk.Toplevel):
         self.geometry("500x520")
 
     def _build(self):
-        from core.marker_sheet import AIMING_MARKS, A4_W_MM
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -1858,7 +1859,6 @@ class MarkerSheetDialog(tk.Toplevel):
         pad = {"padx": 14, "pady": 5}  # keep for legacy refs
 
     def _build_sheet_tab(self, parent):
-        from core.marker_sheet import AIMING_MARKS, A4_W_MM
         pad = {"padx": 14, "pady": 5}
 
         tk.Label(parent, text="Generate Marker Sheet", bg=BG_DARK, fg=ACCENT,
@@ -1963,7 +1963,6 @@ class MarkerSheetDialog(tk.Toplevel):
         self._preview()
 
     def _get(self):
-        from core.marker_sheet import AIMING_MARKS
         key  = self._tvar.get()
         mark = AIMING_MARKS.get(key, AIMING_MARKS["10m_air_rifle"])
         try:    dist = float(self._dvar.get())
@@ -1975,7 +1974,6 @@ class MarkerSheetDialog(tk.Toplevel):
         return key, mark, dist, dist / mark["reference_dist_m"], marker_sz, margin_sz
 
     def _preview(self, *_):
-        from core.marker_sheet import A4_W_MM
         key, mark, dist, scale, marker_sz, margin_sz = self._get()
         # Centre space = A4 width - 2 margins - 2 markers (left+right)
         centre_space = A4_W_MM - 2 * margin_sz - 2 * marker_sz
@@ -2000,12 +1998,10 @@ class MarkerSheetDialog(tk.Toplevel):
             initialfile=f"splatt2_{key}_{dist:.0f}m.png")
         if not out:
             return
-        from core.marker_sheet import generate_marker_sheet
         _, _, _, _, marker_sz, margin_sz = self._get()
         # Save marker/margin back to cfg so tracker stays in sync
         self.cfg["aruco_marker_mm"] = marker_sz
         self.cfg["aruco_margin_mm"] = margin_sz
-        from core.config import save_config
         save_config(self.cfg)
         generate_marker_sheet(out, target_key=key, print_distance_m=dist,
                                show_ring_guides=self._rvar.get(),
@@ -2020,7 +2016,6 @@ class MarkerSheetDialog(tk.Toplevel):
         self.destroy()
     def _build_creator_tab(self, parent):
         """Target editor — create, edit and delete targets from the targets/ folder."""
-        from core.config import TARGETS, _targets_dir
         pad = {"padx": 10, "pady": 3}
         top = tk.Frame(parent, bg=BG_DARK); top.pack(fill="x", **pad)
         tk.Label(top, text="Mode:", bg=BG_DARK, fg=TEXT_SEC,
@@ -2149,7 +2144,6 @@ class MarkerSheetDialog(tk.Toplevel):
 
     def _on_creator_mode(self, event=None):
         """Load an existing target into the editor fields."""
-        from core.config import TARGETS
         mode = self._c_mode.get()
         if mode == "New target":
             self._c_key.set(""); self._c_name.set("")
@@ -2184,7 +2178,6 @@ class MarkerSheetDialog(tk.Toplevel):
 
     def _delete_target(self):
         """Delete a user-created target CSV. Built-in targets can't be removed."""
-        from core.config import TARGETS, _user_targets_dir
         mode = self._c_mode.get()
         if mode == "New target":
             self._c_status.config(text="Select an existing target to delete.", fg=GOLD)
@@ -2208,7 +2201,6 @@ class MarkerSheetDialog(tk.Toplevel):
             import core.config as _cc, core.marker_sheet as _ms
             # Reload — a built-in seed with the same key may now resurface.
             _cc.TARGETS = _cc._load_all_targets()
-            from core.marker_sheet import _get_aiming_marks
             _ms.AIMING_MARKS = _get_aiming_marks()
             self._c_status.config(text=f"Deleted '{t['name']}'.", fg=ACCENT)
             modes = ["New target"] + [f"Edit: {tgt['name']}" for tgt in _cc.TARGETS.values()]
@@ -2219,7 +2211,6 @@ class MarkerSheetDialog(tk.Toplevel):
 
     def _save_target(self):
         """Validate and save the target as a CSV in the user targets dir."""
-        from core.config import _user_targets_dir, _load_target_csv
         import core.config as _cc, core.marker_sheet as _ms
 
         key  = self._c_key.get().strip().replace(" ","_")
@@ -2292,7 +2283,6 @@ class MarkerSheetDialog(tk.Toplevel):
         t = _load_target_csv(path)
         if t:
             _cc.TARGETS[t["key"]] = t
-            from core.marker_sheet import _get_aiming_marks
             _ms.AIMING_MARKS = _get_aiming_marks()
             # Refresh mode dropdown
             modes = ["New target"] + [f"Edit: {tgt['name']}" for tgt in _cc.TARGETS.values()]
@@ -2363,7 +2353,6 @@ class SessionHistoryWindow(tk.Toplevel):
         self.after(200, self._init_renderer)
 
     def _init_renderer(self):
-        from core.target_renderer import TargetRenderer
         w = self._tgt.winfo_width()
         h = self._tgt.winfo_height()
         if w < 50 or h < 50:
@@ -2374,7 +2363,6 @@ class SessionHistoryWindow(tk.Toplevel):
         self._redraw()
 
     def _load(self):
-        from core.session import load_session_history
         # _history is {day_label: [entry, ...]} newest day first
         self._history_dict = load_session_history(self.save_dir)
         # Flatten to a list for display, newest first
@@ -2409,7 +2397,6 @@ class SessionHistoryWindow(tk.Toplevel):
             pass
 
     def _show(self, idx):
-        from core.session import reconstruct_shot_traces
         e = self._history[idx]
         self._sel = e
         dur = e["duration_s"]
@@ -2439,7 +2426,6 @@ class SessionHistoryWindow(tk.Toplevel):
     def _redraw(self):
         if self._renderer is None:
             return
-        from core.session import Shot, ShotTrace, TracePoint, reconstruct_shot_traces
         shots = []
         if self._sel:
             traces = reconstruct_shot_traces(self._sel["raw"])
@@ -3332,7 +3318,6 @@ class SeriesReviewWindow(tk.Toplevel):
         return btn
     def _populate_series_picker(self):
         """Build the day + series dropdowns from live session and saved files."""
-        from core.session import load_session_history
         save_dir = (self.cfg.get("save_directory") or "").strip() or _default_save_dir()
         save_dir = os.path.abspath(save_dir)
 
@@ -3422,7 +3407,6 @@ class SeriesReviewWindow(tk.Toplevel):
             self._view_lbl.config(text="● LIVE" if self._is_live else "○ Past",
                                    fg=ACCENT if self._is_live else TEXT_DIM)
         else:
-            from core.session import Session, Shot, reconstruct_shot_traces
             raw_shots = entry["raw_shots"]
             traces    = reconstruct_shot_traces({"shots": raw_shots})
             fake_sess = Session(entry["history"]["name"])
@@ -3521,7 +3505,6 @@ class SeriesReviewWindow(tk.Toplevel):
         self._update_stats()
         self._redraw()
     def _init_renderer(self):
-        from core.target_renderer import TargetRenderer
         w = self._canvas.winfo_width()
         h = self._canvas.winfo_height()
         if w < 50 or h < 50:
@@ -3535,7 +3518,6 @@ class SeriesReviewWindow(tk.Toplevel):
         self._populate_series_picker()
 
     def _on_canvas_resize(self, event):
-        from core.target_renderer import TargetRenderer
         if event.width < 50 or event.height < 50:
             return
         cal = float(self.cfg.get("shot_circle_calibre_mm",
