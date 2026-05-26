@@ -770,33 +770,32 @@ class SplattApp:
     def _register_shot(self, aim_mm, shot_ts: float = None):
         if not self._series_started:
             return
-        R            = self._scoring_radius_mm()
-        mark_offsets = self.target_cfg.get("mark_offsets")  # None for single-mark
+        R = self._scoring_radius_mm()
+        mark_offsets = self.target_cfg.get("mark_offsets")
 
-        # Step 1: record the shot — this does the retroactive position lookup,
-        # correcting aim_mm to where the crosshair actually was at shot_ts.
-        # We pass a placeholder score of 0.0 and rescore after using the
-        # corrected position, so scoring and drawing use identical coordinates.
-        shot = self.session.record_shot(aim_mm, 0.0, 0,
-                                         shot_timestamp=shot_ts,
-                                         mark_index=0,
-                                         defer_write=True)
+        # Record first with a placeholder score so we can rescore using the
+        # retroactively corrected aim, ensuring scoring and rendering use
+        # the same coordinates.
+        shot = self.session.record_shot(
+            aim_mm, 0.0, 0,
+            shot_timestamp=shot_ts,
+            mark_index=0,
+            defer_write=True,
+        )
         if shot is None:
             self.root.after(0, lambda: self._set_status(
                 "SHOT REJECTED — outside approach zone", ACCENT2))
             return
 
-        # Step 2: score from the retroactively corrected position
-        score, ring, mark_idx = score_shot(shot.aim_mm, R,
-                                            decimal=self._decimal_scoring,
-                                            mark_offsets=mark_offsets)
-
-        # Step 3: update the shot with the correct score and mark
-        shot.score      = score
+        score, ring, mark_idx = score_shot(
+            shot.aim_mm, R,
+            decimal=self._decimal_scoring,
+            mark_offsets=mark_offsets,
+        )
+        shot.score = score
         shot.ring_index = ring
         shot.mark_index = mark_idx
 
-        # Step 4: rewrite the live CSV row with the correct score
         if self.session._writer and self.session._writer.is_open:
             self.session._writer.write_shot(shot)
 
@@ -805,20 +804,16 @@ class SplattApp:
             self.root.after(0, lambda: self._set_status(
                 "Miss ignored (score 0)", TEXT_DIM))
             return
-        if shot is None:
-            self.root.after(0, lambda: self._set_status(
-                "SHOT REJECTED — outside approach zone", ACCENT2))
-            return
-        import time as _t
-        self._last_shot_fired_time = _t.time()
+
+        self._last_shot_fired_time = time.time()
         self._last_shot_info = shot
-        sc = shot.score
-        sc_s = f"{sc:.1f}" if sc != int(sc) else str(int(sc))
-        col = GOLD if sc >= 10 else (ACCENT if sc >= 9 else
-              TEXT_PRI if sc >= 7 else ACCENT2)
-        _lbl = (f"Shot #{shot.index} (mark {mark_idx+1}): {sc_s} pts"
-                if mark_offsets else f"Shot #{shot.index}: {sc_s} pts")
-        self.root.after(0, lambda lbl=_lbl, c=col: self._set_status(lbl, c))
+        sc_s = f"{score:.1f}" if score != int(score) else str(int(score))
+        col = (GOLD if score >= 10 else
+               ACCENT if score >= 9 else
+               TEXT_PRI if score >= 7 else ACCENT2)
+        label = (f"Shot #{shot.index} (mark {mark_idx + 1}): {sc_s} pts"
+                 if mark_offsets else f"Shot #{shot.index}: {sc_s} pts")
+        self.root.after(0, lambda lbl=label, c=col: self._set_status(lbl, c))
 
 
     def _open_camera_properties(self):
