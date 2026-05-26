@@ -50,6 +50,33 @@ def _default_save_dir() -> str:
         return os.path.join(os.path.expanduser("~"), "Documents", "Splatt2")
 
 
+_ROTATION_FLAGS = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+class _FpsCounter:
+    """Rolling FPS counter that updates twice per second."""
+
+    def __init__(self, window_s: float = 0.5):
+        self._window = window_s
+        self._frames = 0
+        self._last = time.time()
+        self.value = 0.0
+
+    def tick(self) -> float:
+        self._frames += 1
+        now = time.time()
+        elapsed = now - self._last
+        if elapsed >= self._window:
+            self.value = self._frames / elapsed
+            self._frames = 0
+            self._last = now
+        return self.value
+
+
 def _compute_scoring_radius_mm(target_cfg: dict, cfg: dict) -> float:
     """Single source of truth for the scoring radius (R = card_r + pellet_r)."""
     card_r = target_cfg["diameter_mm"] / 2.0
@@ -616,16 +643,11 @@ class SplattApp:
         - UI preview is only updated every N frames to save tkinter overhead
         - 'no_video_mode': skip annotated frame entirely, pure tracking only
         """
-        no_video   = self.cfg.get("no_video_mode", False)
-        ui_every   = 3        # send frame to UI every 3rd detection
+        no_video = self.cfg.get("no_video_mode", False)
+        ui_every = 3
         ui_counter = 0
-        detect_w   = 640      # ArUco detection width (never larger than capture)
-        detect_h   = 480
-
-        # Live FPS measurement
-        _fps_frame_count = 0
-        _fps_last_time   = time.time()
-        _fps_display     = 0.0
+        detect_w, detect_h = 640, 480
+        fps = _FpsCounter()
 
         while self._running:
             if not self._cap or not self._cap.isOpened():
@@ -635,107 +657,109 @@ class SplattApp:
                 time.sleep(0.005)
                 continue
 
-
             if self.cfg.get("flip_image"):
                 frame = cv2.flip(frame, self.cfg.get("flip_mode", -1))
+            rotation = _ROTATION_FLAGS.get(self._camera_rotation)
+            if rotation is not None:
+                frame = cv2.rotate(frame, rotation)
 
-            # Camera rotation (0 / 90 / 180 / 270 degrees)
-            rot = self._camera_rotation
-            if rot == 90:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            elif rot == 180:
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
-            elif rot == 270:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-            # Downscale for detection — major speed improvement
-            fh, fw = frame.shape[:2]
-            if fw > detect_w or fh > detect_h:
-                scale = min(detect_w / fw, detect_h / fh)
-                small = cv2.resize(frame,
-                                   (int(fw * scale), int(fh * scale)),
-                                   interpolation=cv2.INTER_LINEAR)
-            else:
-                small = frame
-
-            # Laplacian variance — only computed when focus assist is on
+            small = self._downscale_for_detection(frame, detect_w, detect_h)
             if self._focus_active:
-                _lap = cv2.Laplacian(small if len(small.shape)==2
-                                     else cv2.cvtColor(small, cv2.COLOR_BGR2GRAY),
-                                     cv2.CV_64F)
-                self._sharpness = float(_lap.var())
+                self._sharpness = self._measure_sharpness(small)
 
             result = self.tracker.process_frame(small)
             self._tracking_quality = result.quality
             self._current_markers_found = result.markers_found
 
             if result.aim_mm is not None and not self._paused:
-                raw = result.aim_mm
-                zeroed = (raw[0] - self._zero_offset[0],
-                          raw[1] - self._zero_offset[1])
-                if result.quality >= 0.25:
-                    filtered = self._reject_spike(zeroed)
-                    self._raw_aim_prev2 = self._raw_aim_prev
-                    self._raw_aim_prev = zeroed
-                    smoothed = self._smoother.update(filtered)
-                    self._current_aim_mm = smoothed
-                    in_appr, on_tgt = self.session.update_aim(smoothed)
-                    self._in_approach_zone = in_appr
-                    self._on_target_status = on_tgt
+                self._consume_aim(result)
 
-            # Measure actual delivered FPS
-            _fps_frame_count += 1
-            _fps_now = time.time()
-            _fps_elapsed = _fps_now - _fps_last_time
-            if _fps_elapsed >= 0.5:   # update every half second
-                _fps_display     = _fps_frame_count / _fps_elapsed
-                _fps_frame_count = 0
-                _fps_last_time   = _fps_now
-            self._live_fps = _fps_display
-            # Update sharpness peak hold (only when focus assist is on)
+            self._live_fps = fps.tick()
             if self._focus_active:
-                _now = time.time()
-                if self._sharpness >= self._sharpness_peak:
-                    self._sharpness_peak   = self._sharpness
-                    self._sharpness_peak_t = _now
-                elif _now - self._sharpness_peak_t > 3.0:
-                    self._sharpness_peak = self._sharpness
+                self._update_sharpness_peak()
 
-            # Only update UI preview every N frames and not in no_video mode
             ui_counter += 1
             if not no_video and ui_counter >= ui_every:
-                # Overlay FPS on the camera frame
-                disp = result.frame_display.copy() if result.frame_display is not None else None
-                if disp is not None:
-                    fps_txt = f"{_fps_display:.1f} fps"
-                    cv2.putText(disp, fps_txt, (6, 16),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                                (80, 220, 80), 1, cv2.LINE_AA)
-                    self._latest_cam_frame = disp
+                self._publish_camera_frame(result.frame_display, self._live_fps)
                 ui_counter = 0
 
-            try:
-                shot_ts = self._shot_queue.get_nowait()
-                if self._current_aim_mm is not None:
-                    if self._zero_mode:
-                        if self._tracking_quality > 0:
-                            # Markers visible — apply zero
-                            self._apply_zero(self._current_aim_mm)
-                        else:
-                            # No markers — ignore trigger, stay in zero mode
-                            self.root.after(0, lambda: self._set_status(
-                                "ZERO MODE — no markers, try again", GOLD))
-                    elif self._tracking_quality > 0:
-                        # quality > 0 means we have a valid homography
-                        # Pass shot_ts so record_shot can retroactively look up
-                        # the camera position at the exact audio trigger moment
-                        self._register_shot(self._current_aim_mm, shot_ts)
-                    else:
-                        # quality == 0: no homography at all, camera lost
-                        self.root.after(0, lambda: self._set_status(
-                            "SHOT REJECTED — no tracking", ACCENT2))
-            except queue.Empty:
-                pass
+            self._drain_shot_queue()
+
+    def _downscale_for_detection(self, frame, max_w: int, max_h: int):
+        """Resize ``frame`` so it fits within (max_w, max_h) for detection."""
+        fh, fw = frame.shape[:2]
+        if fw <= max_w and fh <= max_h:
+            return frame
+        scale = min(max_w / fw, max_h / fh)
+        return cv2.resize(
+            frame, (int(fw * scale), int(fh * scale)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    @staticmethod
+    def _measure_sharpness(frame) -> float:
+        """Laplacian variance — proxy for focus quality."""
+        gray = (frame if len(frame.shape) == 2
+                else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _update_sharpness_peak(self) -> None:
+        now = time.time()
+        if self._sharpness >= self._sharpness_peak:
+            self._sharpness_peak = self._sharpness
+            self._sharpness_peak_t = now
+        elif now - self._sharpness_peak_t > 3.0:
+            self._sharpness_peak = self._sharpness
+
+    def _consume_aim(self, result) -> None:
+        """Apply zero, spike-filter, smooth and feed the session aim."""
+        raw = result.aim_mm
+        zeroed = (raw[0] - self._zero_offset[0],
+                  raw[1] - self._zero_offset[1])
+        if result.quality < 0.25:
+            return
+        filtered = self._reject_spike(zeroed)
+        self._raw_aim_prev2 = self._raw_aim_prev
+        self._raw_aim_prev = zeroed
+        smoothed = self._smoother.update(filtered)
+        self._current_aim_mm = smoothed
+        in_appr, on_tgt = self.session.update_aim(smoothed)
+        self._in_approach_zone = in_appr
+        self._on_target_status = on_tgt
+
+    def _publish_camera_frame(self, frame_display, live_fps: float) -> None:
+        """Annotate the latest detection frame and hand it to the UI thread."""
+        if frame_display is None:
+            return
+        disp = frame_display.copy()
+        cv2.putText(disp, f"{live_fps:.1f} fps", (6, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (80, 220, 80), 1, cv2.LINE_AA)
+        self._latest_cam_frame = disp
+
+    def _drain_shot_queue(self) -> None:
+        """Process any queued audio triggers against the current aim."""
+        try:
+            shot_ts = self._shot_queue.get_nowait()
+        except queue.Empty:
+            return
+
+        if self._current_aim_mm is None:
+            return
+
+        if self._zero_mode:
+            if self._tracking_quality > 0:
+                self._apply_zero(self._current_aim_mm)
+            else:
+                self.root.after(0, lambda: self._set_status(
+                    "ZERO MODE — no markers, try again", GOLD))
+            return
+
+        if self._tracking_quality > 0:
+            self._register_shot(self._current_aim_mm, shot_ts)
+        else:
+            self.root.after(0, lambda: self._set_status(
+                "SHOT REJECTED — no tracking", ACCENT2))
 
     def _reject_spike(self, zeroed: tuple) -> tuple:
         """Return ``zeroed`` unless it is a bad homography spike.
