@@ -1372,27 +1372,37 @@ class SplattApp:
     def _open_settings(self):
         SettingsDialog(self.root, self.cfg, self._apply_settings)
 
+    _CAM_RESTART_KEYS = frozenset({
+        "video_width", "video_height", "video_fps",
+        "camera_index", "no_video_mode",
+    })
+    _TRACKER_REBUILD_KEYS = frozenset({
+        "aruco_marker_mm", "aruco_margin_mm", "aruco_dict",
+        "use_clahe", "clahe_clip", "aruco_marker_count",
+        "brightness_target",
+    })
+
     def _apply_settings(self, new_cfg):
-        cam_keys = {"video_width", "video_height", "video_fps",
-                    "camera_index", "no_video_mode"}
-        cam_changed = any(new_cfg.get(k) != self.cfg.get(k) for k in cam_keys)
+        cam_changed = any(new_cfg.get(k) != self.cfg.get(k)
+                          for k in self._CAM_RESTART_KEYS)
+        tracker_changed = any(new_cfg.get(k) != self.cfg.get(k)
+                              for k in self._TRACKER_REBUILD_KEYS)
 
         self.cfg.update(new_cfg)
         save_config(self.cfg)
         self.target_cfg = TARGETS[self.cfg["target_key"]]
         self.target_renderer = None
 
-        # Audio — applies live
+        # Audio settings apply live.
         self.audio.set_threshold(self.cfg["audio_trigger_threshold"])
         self.audio.set_transient_ratio(self.cfg.get("audio_transient_ratio", 6.0))
         self.audio.set_cooldown(self.cfg["audio_trigger_cooldown_ms"])
         self._thresh_var.set(self.cfg["audio_trigger_threshold"])
         self._ratio_var.set(self.cfg.get("audio_transient_ratio", 6.0))
+        self._post_shot_cooldown_s = float(
+            self.cfg.get("post_shot_cooldown_s", 2.0))
 
-        # Cooldown — live
-        self._post_shot_cooldown_s = float(self.cfg.get("post_shot_cooldown_s", 2.0))
-
-        # Smoother — live, no restart needed
+        # Smoother is cheap to rebuild.
         self._smoother = make_smoother(
             self.cfg.get("smooth_mode", "ema"),
             alpha=float(self.cfg.get("smooth_alpha", 0.35)),
@@ -1401,9 +1411,7 @@ class SplattApp:
         )
         self._smoother.reset()
 
-        # Rebuild tracker if marker size changed
-        marker_keys = {"aruco_marker_mm", "aruco_margin_mm", "aruco_dict", "use_clahe", "clahe_clip", "aruco_marker_count", "brightness_target"}
-        if any(new_cfg.get(k) != self.cfg.get(k) for k in marker_keys):
+        if tracker_changed:
             self.tracker = ArucoTracker(
                 aruco_dict_name=self.cfg["aruco_dict"],
                 marker_size_mm=float(self.cfg.get("aruco_marker_mm", 40.0)),
@@ -1411,26 +1419,26 @@ class SplattApp:
                 use_clahe=bool(self.cfg.get("use_clahe", True)),
                 clahe_clip=float(self.cfg.get("clahe_clip", 4.0)),
                 marker_count=int(self.cfg.get("aruco_marker_count", 4)),
-                brightness_target=float(self.cfg.get("brightness_target", 128.0)),
+                brightness_target=float(
+                    self.cfg.get("brightness_target", 128.0)),
             )
 
-        # Rotation — applies immediately to camera loop
         self._camera_rotation = int(self.cfg.get("camera_rotation", 0))
-        self._fine_zero_mode = False   # click-on-canvas zero fine-tune
+        self._fine_zero_mode = False
         if hasattr(self, "_btn_rotate"):
             rot = self._camera_rotation
-            self._btn_rotate.config(text=f"↻ {rot}°",
+            self._btn_rotate.config(
+                text=f"↻ {rot}°",
                 bg=BG_CARD if rot == 0 else ACCENT,
-                fg=TEXT_SEC if rot == 0 else BG_DARK)
+                fg=TEXT_SEC if rot == 0 else BG_DARK,
+            )
 
-        # Sync zero offset from config (reset via Settings takes effect now)
         self._zero_offset = (
             float(self.cfg.get("zero_offset_x", 0.0)),
             float(self.cfg.get("zero_offset_y", 0.0)),
         )
-        self._apply_session_cfg()  # push new cfg values into live session
+        self._apply_session_cfg()
 
-        # Camera resolution/fps — restart to take effect
         if cam_changed and self._running:
             self._set_status("Restarting camera with new settings…", GOLD)
             self._stop_camera()
