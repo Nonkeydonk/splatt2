@@ -8,6 +8,7 @@ windows live alongside it: :class:`MarkerSheetDialog`,
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import sys
@@ -669,33 +670,9 @@ class SplattApp:
                 zeroed = (raw[0] - self._zero_offset[0],
                           raw[1] - self._zero_offset[1])
                 if result.quality >= 0.25:
-                    # Detects bad homography spikes: a large jump that immediately
-                    # reverses. Genuine fast movement (recoil, swing) continues
-                    # in the same direction — it does not sharply reverse.
-                    filtered = zeroed
-                    if self._raw_aim_prev is not None:
-                        import math as _m
-                        spk_vel  = float(self.cfg.get("spike_velocity_mm", 25.0))
-                        spk_rev  = float(self.cfg.get("spike_reversal", 0.7))
-                        px, py   = self._raw_aim_prev
-                        vx = zeroed[0] - px
-                        vy = zeroed[1] - py
-                        speed = _m.sqrt(vx*vx + vy*vy)
-                        if speed > spk_vel and self._raw_aim_prev2 is not None:
-                            # Check if previous frame also had a large jump
-                            # and this frame reverses it
-                            p2x, p2y = self._raw_aim_prev2
-                            v2x = px - p2x
-                            v2y = py - p2y
-                            dot = vx*v2x + vy*v2y
-                            mag2 = _m.sqrt(v2x*v2x + v2y*v2y)
-                            if mag2 > spk_vel and dot < -spk_rev * speed * mag2:
-                                # Sharp reversal detected — this frame is the
-                                # return from a spike. Discard both spike frames.
-                                filtered = self._raw_aim_prev2
-                                self._raw_aim_prev  = self._raw_aim_prev2
+                    filtered = self._reject_spike(zeroed)
                     self._raw_aim_prev2 = self._raw_aim_prev
-                    self._raw_aim_prev  = zeroed
+                    self._raw_aim_prev = zeroed
                     smoothed = self._smoother.update(filtered)
                     self._current_aim_mm = smoothed
                     in_appr, on_tgt = self.session.update_aim(smoothed)
@@ -755,6 +732,41 @@ class SplattApp:
                             "SHOT REJECTED — no tracking", ACCENT2))
             except queue.Empty:
                 pass
+
+    def _reject_spike(self, zeroed: tuple) -> tuple:
+        """Return ``zeroed`` unless it is a bad homography spike.
+
+        A spike is detected when the previous and current frames both
+        show large displacements but in nearly opposite directions:
+        genuine fast movement keeps direction; a marker dropout snaps
+        to a wrong position then back.
+        """
+        if self._raw_aim_prev is None or self._raw_aim_prev2 is None:
+            return zeroed
+
+        spike_velocity = float(self.cfg.get("spike_velocity_mm", 25.0))
+        reversal = float(self.cfg.get("spike_reversal", 0.7))
+
+        px, py = self._raw_aim_prev
+        vx = zeroed[0] - px
+        vy = zeroed[1] - py
+        speed = math.hypot(vx, vy)
+        if speed <= spike_velocity:
+            return zeroed
+
+        p2x, p2y = self._raw_aim_prev2
+        v2x = px - p2x
+        v2y = py - p2y
+        prev_speed = math.hypot(v2x, v2y)
+        if prev_speed <= spike_velocity:
+            return zeroed
+
+        dot = vx * v2x + vy * v2y
+        if dot < -reversal * speed * prev_speed:
+            # Discard the spike pair: roll the running history back one frame.
+            self._raw_aim_prev = self._raw_aim_prev2
+            return self._raw_aim_prev2
+        return zeroed
 
     def _on_shot_detected(self, ts):
         if self._paused:
@@ -1406,11 +1418,10 @@ class SplattApp:
                                      APPROACH_ZONE_FACTOR))
         R = self._scoring_radius_mm()
         self.session.scoring_radius_mm = R
-        # For multi-mark targets, the approach zone must cover the furthest mark
+        # For multi-mark targets, the approach zone must cover the furthest mark.
         mark_offsets = self.target_cfg.get("mark_offsets")
         if mark_offsets:
-            import math as _m
-            max_mark_r = max(_m.sqrt(mx**2 + my**2) for mx, my in mark_offsets)
+            max_mark_r = max(math.hypot(mx, my) for mx, my in mark_offsets)
             self.session.approach_radius_mm = (R + max_mark_r) * factor
         else:
             self.session.approach_radius_mm = R * factor
