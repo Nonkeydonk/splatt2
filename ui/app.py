@@ -548,29 +548,42 @@ class SplattApp:
         self._cam_var.set("Scanning...")
         self.root.after(10, self._do_scan)
 
+    @staticmethod
+    def _probe_camera(idx: int):
+        """Return ``(width, height)`` for the camera at ``idx`` if openable."""
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        try:
+            if not cap.isOpened():
+                return None
+            return (
+                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            )
+        finally:
+            cap.release()
+
     def _do_scan(self):
         found = []
         for i in range(8):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            size = self._probe_camera(i)
+            if size is not None:
+                w, h = size
                 found.append((i, f"{i}: Camera {i}  ({w}x{h})"))
-                cap.release()
-            else:
-                cap.release()
         if not found:
             found = [(i, f"{i}: Camera {i}") for i in range(4)]
-        self._cam_entries = {lbl: idx for idx, lbl in found}
-        labels = [lbl for _, lbl in found]
+
+        self._cam_entries = {label: idx for idx, label in found}
+        labels = [label for _, label in found]
         self._cam_combo["values"] = labels
         self._cam_combo.config(state="readonly")
-        cur = self.cfg.get("camera_index", 0)
-        for lbl in labels:
-            if lbl.startswith(str(cur) + ":"):
-                self._cam_var.set(lbl)
-                return
-        if labels:
+
+        current = self.cfg.get("camera_index", 0)
+        prefix = f"{current}:"
+        match = next((label for label in labels
+                      if label.startswith(prefix)), None)
+        if match is not None:
+            self._cam_var.set(match)
+        elif labels:
             self._cam_var.set(labels[0])
 
     def _on_cam_selected(self, event=None):
