@@ -1963,14 +1963,18 @@ class MarkerSheetDialog(tk.Toplevel):
         self._preview()
 
     def _get(self):
-        key  = self._tvar.get()
+        key = self._tvar.get()
         mark = AIMING_MARKS.get(key, AIMING_MARKS["10m_air_rifle"])
-        try:    dist = float(self._dvar.get())
-        except: dist = mark["reference_dist_m"]
-        try:    marker_sz = max(10.0, float(self._mvar.get()))
-        except: marker_sz = 40.0
-        try:    margin_sz = max(3.0,  float(self._mgvar.get()))
-        except: margin_sz = 8.0
+
+        def _to_float(var, default):
+            try:
+                return float(var.get())
+            except (TypeError, ValueError):
+                return default
+
+        dist = _to_float(self._dvar, mark["reference_dist_m"])
+        marker_sz = max(10.0, _to_float(self._mvar, 40.0))
+        margin_sz = max(3.0, _to_float(self._mgvar, 8.0))
         return key, mark, dist, dist / mark["reference_dist_m"], marker_sz, margin_sz
 
     def _preview(self, *_):
