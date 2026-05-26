@@ -1706,13 +1706,19 @@ class SplattApp:
     def _editor_select_all(self, value: bool):
         for var in self._editor_shot_vars.values():
             var.set(value)
+    _KEY_BINDINGS = {
+        "p": "_toggle_pause",
+        "space": "_undo_shot",
+        "r": "_reset_all",
+        "q": "_on_close",
+        "s": "_save_csv",
+    }
+
     def _on_key(self, event):
-        k = event.keysym.lower()
-        if k == "p":         self._toggle_pause()
-        elif k == "space":   self._undo_shot()
-        elif k == "r":       self._reset_all()
-        elif k == "q":       self._on_close()
-        elif k == "s":       self._save_csv()
+        action = self._KEY_BINDINGS.get(event.keysym.lower())
+        if action:
+            getattr(self, action)()
+
     def _on_close(self):
         self._running = False
         self.audio.stop()
