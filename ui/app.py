@@ -1,69 +1,43 @@
-"""
-ui/app.py — Splatt2 main window.
+"""Splatt2 Tkinter UI.
 
-Layout:
-  Top bar    : title, session name, Sessions history button, status
-  Left       : camera feed + camera selector + tracking quality
-  Centre     : target canvas
-  Right      : score panel OR series-complete editor (swappable)
-  Bottom     : pause / zero / decimal / mic sensitivity slider / on-target indicator
+The main window is :class:`SplattApp`. Modal dialogs and review
+windows live alongside it: :class:`MarkerSheetDialog`,
+:class:`SessionHistoryWindow`, :class:`SettingsDialog` and
+:class:`SeriesReviewWindow`.
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from __future__ import annotations
+
+import os
+import queue
+import sys
 import threading
 import time
-import queue
-import os
-import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from core.config import load_config, save_config, TARGETS, VERSION
-from core.tracker import ArucoTracker, score_shot
 from core.audio import AudioDetector
+from core.config import TARGETS, VERSION, load_config, save_config
+from core.marker_sheet import generate_marker_sheet
 from core.session import (Session, Shot, ShotTrace,
                           load_session_history, reconstruct_shot_traces)
-from core.target_renderer import TargetRenderer
-from core.marker_sheet import generate_marker_sheet
 from core.smoother import make_smoother
-
-# ── Palette ───────────────────────────────────────────────────────────────────
-BG_DARK  = "#0f0f13"
-BG_MID   = "#16161d"
-BG_PANEL = "#1c1c25"
-BG_CARD  = "#22222e"
-ACCENT   = "#00e5a0"
-ACCENT2  = "#ff4f6d"
-TEXT_PRI = "#f0f0f8"
-TEXT_SEC = "#c0c0d8"
-TEXT_DIM = "#9090b0"
-BORDER   = "#2a2a3a"
-GOLD     = "#ffd060"
-
-FM = ("Consolas", 10)
-FT = ("Segoe UI", 9, "bold")
-FS = ("Consolas", 42, "bold")
-FL = ("Segoe UI", 9)
-FB = ("Segoe UI", 10)
-FH = ("Segoe UI", 11)
-
-
-def _mk_btn(parent, text, cmd, accent=False, width=None):
-    fg = BG_DARK if accent else TEXT_SEC
-    bg = ACCENT if accent else BG_CARD
-    kw = dict(bg=bg, fg=fg, activebackground=ACCENT if accent else BORDER,
-              activeforeground=fg, font=FB, relief="flat", bd=0,
-              padx=8, pady=5, cursor="hand2", text=text, command=cmd)
-    if width:
-        kw["width"] = width
-    return tk.Button(parent, **kw)
+from core.target_renderer import TargetRenderer
+from core.tracker import ArucoTracker, score_shot
+from ui.theme import (
+    ACCENT, ACCENT2, BG_CARD, BG_DARK, BG_MID, BG_PANEL, BORDER, GOLD,
+    TEXT_DIM, TEXT_PRI, TEXT_SEC,
+    FB, FH, FL, FM, FS, FT,
+    make_button as _mk_btn,
+)
 
 
 def _default_save_dir() -> str:
-    """Per-user sessions/ folder. Falls back to ~/Documents/Splatt2 on error."""
+    """Per-user ``sessions/`` folder, with a documents fallback on error."""
     try:
         from core.paths import sessions_dir
         return str(sessions_dir())
