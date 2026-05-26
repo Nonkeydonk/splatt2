@@ -1,9 +1,18 @@
-"""Path resolution for source, PyInstaller and Nuitka builds.
+"""Filesystem paths for source, PyInstaller and Nuitka builds.
 
-`resource_path` returns bundled read-only assets (targets/ etc).
-`user_data_dir` and friends return writable per-user paths following
-OS conventions. Set SPLATT2_USER_DIR to override the user dir.
+``resource_path`` returns paths to bundled read-only assets (target CSVs,
+icons, etc). ``user_data_dir`` and its callers return writable per-user
+locations that follow OS conventions:
+
+- macOS: ``~/Library/Application Support/Splatt2``
+- Windows: ``%APPDATA%/Splatt2``
+- Linux: ``$XDG_DATA_HOME/Splatt2`` or ``~/.local/share/Splatt2``
+
+Set ``SPLATT2_USER_DIR`` to override the user directory entirely (useful
+for portable installs and tests).
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -14,15 +23,15 @@ APP_NAME = "Splatt2"
 
 def is_frozen() -> bool:
     """True when running from a PyInstaller or Nuitka bundle."""
-    return (getattr(sys, "frozen", False)
-            or hasattr(sys, "_MEIPASS")
-            or "__compiled__" in globals())
+    return (
+        getattr(sys, "frozen", False)
+        or hasattr(sys, "_MEIPASS")
+        or "__compiled__" in globals()
+    )
 
 
 def _bundle_root() -> Path:
-    # PyInstaller sets _MEIPASS to the bundle root (extracted temp dir
-    # for onefile, _internal/ for onedir). Source and Nuitka layouts
-    # both have core/ one level below the project root.
+    """Root of the running bundle, or the project root when run from source."""
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         return Path(meipass)
@@ -57,25 +66,27 @@ def user_data_dir() -> Path:
 
 
 def config_path() -> Path:
+    """Path to the user's persisted config file."""
     return user_data_dir() / "splatt2_config.json"
 
 
 def crash_log_path() -> Path:
+    """Path to the user's crash log file."""
     return user_data_dir() / "splatt2_crash.log"
 
 
 def sessions_dir() -> Path:
-    """Default sessions/ folder, created on first access."""
+    """Default ``sessions/`` folder, created on first access."""
     p = user_data_dir() / "sessions"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def user_targets_dir() -> Path:
-    """User-writable targets/ folder, created on first access.
+    """User-writable ``targets/`` folder, created on first access.
 
     Bundled targets remain read-only seeds; targets created or edited
-    in-app are written here and merged at load time.
+    in-app are written here and merged with the seeds at load time.
     """
     p = user_data_dir() / "targets"
     p.mkdir(parents=True, exist_ok=True)
