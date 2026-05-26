@@ -6,6 +6,8 @@ All user-configurable settings and target definitions.
 import json
 import os
 
+from core.paths import resource_path
+
 VERSION = "1.1.0"
 
 def _config_path() -> str:
@@ -24,11 +26,8 @@ CONFIG_FILE = _config_path()
 # Ring diameters are in mm (not radii). Innermost ring first.
 
 def _targets_dir() -> str:
-    """Return the absolute path to the targets/ folder."""
-    import os
-    base = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(base)  # up from core/ to project root
-    return os.path.join(base, "targets")
+    """Path to the bundled targets/ folder."""
+    return str(resource_path("targets"))
 
 
 def _load_target_csv(path: str) -> dict:
