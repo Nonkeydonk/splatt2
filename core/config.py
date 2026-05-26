@@ -5,17 +5,31 @@ All user-configurable settings and target definitions.
 
 import json
 import os
+import shutil
+
+from core.paths import config_path, resource_path, user_targets_dir
 
 VERSION = "1.1.0"
 
-def _config_path() -> str:
-    """Config file lives in the project root (next to main.py)."""
-    import os
-    base = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(base)  # up from core/ to project root
-    return os.path.join(base, "splatt2_config.json")
+CONFIG_FILE = str(config_path())
 
-CONFIG_FILE = _config_path()
+
+def _migrate_legacy_config() -> None:
+    """Copy a pre-1.2 config sitting next to main.py into the user dir."""
+    if os.path.exists(CONFIG_FILE):
+        return
+    legacy = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "splatt2_config.json")
+    if os.path.isfile(legacy):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            shutil.copy2(legacy, CONFIG_FILE)
+            print(f"[Config] Migrated legacy config -> {CONFIG_FILE}")
+        except OSError as e:
+            print(f"[Config] Could not migrate legacy config: {e}")
+
+
+_migrate_legacy_config()
 
 # ── Target definitions — loaded from targets/ folder ────────────────────────
 # Each .csv in the targets/ folder defines one target.
@@ -24,11 +38,13 @@ CONFIG_FILE = _config_path()
 # Ring diameters are in mm (not radii). Innermost ring first.
 
 def _targets_dir() -> str:
-    """Return the absolute path to the targets/ folder."""
-    import os
-    base = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(base)  # up from core/ to project root
-    return os.path.join(base, "targets")
+    """Path to the bundled targets/ folder (read-only seeds)."""
+    return str(resource_path("targets"))
+
+
+def _user_targets_dir() -> str:
+    """Path to the user-writable targets/ folder."""
+    return str(user_targets_dir())
 
 
 def _load_target_csv(path: str) -> dict:
@@ -132,19 +148,21 @@ def _load_target_csv(path: str) -> dict:
     }
 
 def _load_all_targets() -> dict:
-    """Load all .csv files from the targets/ folder. Returns {key: target_dict}."""
-    tdir = _targets_dir()
+    """Load targets from the bundled and user dirs.
+
+    User files override bundled files when keys collide, so a shooter
+    can tweak a built-in target without losing the original.
+    """
     targets = {}
-    if not os.path.isdir(tdir):
-        print(f"[Targets] Folder not found: {tdir}")
-        return targets
-    for fname in sorted(os.listdir(tdir)):
-        if not fname.lower().endswith(".csv"):
+    for tdir in (_targets_dir(), _user_targets_dir()):
+        if not os.path.isdir(tdir):
             continue
-        path = os.path.join(tdir, fname)
-        t = _load_target_csv(path)
-        if t:
-            targets[t["key"]] = t
+        for fname in sorted(os.listdir(tdir)):
+            if not fname.lower().endswith(".csv"):
+                continue
+            t = _load_target_csv(os.path.join(tdir, fname))
+            if t:
+                targets[t["key"]] = t
     return targets
 
 
@@ -225,7 +243,7 @@ DEFAULT_CONFIG = {
     "session_name":       "Session",
     "shooter_name":       "",
     "shots_per_series":   10,
-    "save_directory":     "",    # empty = sessions/ folder next to the app
+    "save_directory":     "",    # empty = sessions/ folder in user data dir
 }
 
 
@@ -245,6 +263,7 @@ def load_config():
 
 def save_config(cfg: dict):
     try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:

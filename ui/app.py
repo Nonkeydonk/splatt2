@@ -63,10 +63,10 @@ def _mk_btn(parent, text, cmd, accent=False, width=None):
 
 
 def _default_save_dir() -> str:
-    """sessions/ subfolder in the project root (next to main.py)."""
+    """Per-user sessions/ folder. Falls back to ~/Documents/Splatt2 on error."""
     try:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(base, "sessions")
+        from core.paths import sessions_dir
+        return str(sessions_dir())
     except Exception:
         return os.path.join(os.path.expanduser("~"), "Documents", "Splatt2")
 
@@ -2260,8 +2260,8 @@ class MarkerSheetDialog(tk.Toplevel):
         self._update_creator_preview()
 
     def _delete_target(self):
-        """Delete the selected existing target CSV."""
-        from core.config import TARGETS, _targets_dir
+        """Delete a user-created target CSV. Built-in targets can't be removed."""
+        from core.config import TARGETS, _user_targets_dir
         mode = self._c_mode.get()
         if mode == "New target":
             self._c_status.config(text="Select an existing target to delete.", fg=GOLD)
@@ -2270,29 +2270,33 @@ class MarkerSheetDialog(tk.Toplevel):
         t   = next((t for t in TARGETS.values() if t["name"] == key), None)
         if t is None:
             return
+        path = os.path.join(_user_targets_dir(), f"{t['key']}.csv")
+        if not os.path.isfile(path):
+            self._c_status.config(
+                text=f"'{t['name']}' is a built-in target and can't be deleted.",
+                fg=GOLD)
+            return
         if not messagebox.askyesno("Delete Target",
                 f"Permanently delete '{t['name']}' ({t['key']}.csv)?\n"
                 "This cannot be undone."):
             return
-        import os as _os
-        path = _os.path.join(_targets_dir(), f"{t['key']}.csv")
         try:
-            _os.remove(path)
+            os.remove(path)
             import core.config as _cc, core.marker_sheet as _ms
-            _cc.TARGETS.pop(t["key"], None)
+            # Reload — a built-in seed with the same key may now resurface.
+            _cc.TARGETS = _cc._load_all_targets()
             from core.marker_sheet import _get_aiming_marks
             _ms.AIMING_MARKS = _get_aiming_marks()
             self._c_status.config(text=f"Deleted '{t['name']}'.", fg=ACCENT)
-            # Refresh mode dropdown
             modes = ["New target"] + [f"Edit: {tgt['name']}" for tgt in _cc.TARGETS.values()]
             self._c_mode_combo["values"] = modes
             self._c_mode.set("New target")
-        except Exception as e:
+        except OSError as e:
             self._c_status.config(text=f"Delete failed: {e}", fg=ACCENT2)
 
     def _save_target(self):
-        """Validate and save the target as a CSV in the targets/ folder."""
-        from core.config import _targets_dir, _load_target_csv
+        """Validate and save the target as a CSV in the user targets dir."""
+        from core.config import _user_targets_dir, _load_target_csv
         import core.config as _cc, core.marker_sheet as _ms
 
         key  = self._c_key.get().strip().replace(" ","_")
@@ -2332,7 +2336,7 @@ class MarkerSheetDialog(tk.Toplevel):
             card_d = diameters[-1]
 
         # Check if overwriting a file
-        tdir  = _targets_dir()
+        tdir  = _user_targets_dir()
         os.makedirs(tdir, exist_ok=True)
         fname = f"{key}.csv"
         path  = os.path.join(tdir, fname)
