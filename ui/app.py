@@ -45,20 +45,25 @@ def _default_save_dir() -> str:
         return os.path.join(os.path.expanduser("~"), "Documents", "Splatt2")
 
 
+def _compute_scoring_radius_mm(target_cfg: dict, cfg: dict) -> float:
+    """Single source of truth for the scoring radius (R = card_r + pellet_r)."""
+    card_r = target_cfg["diameter_mm"] / 2.0
+    calibre = float(cfg.get("scoring_calibre_mm",
+                            target_cfg.get("calibre_mm", 4.5)))
+    return card_r + calibre / 2.0
+
+
 class SplattApp:
     def __init__(self):
         self.cfg, self._first_run = load_config()
         self.target_cfg = TARGETS[self.cfg["target_key"]]
-        _card_r   = self.target_cfg["diameter_mm"] / 2.0
-        _calibre  = float(self.cfg.get("scoring_calibre_mm",
-                          self.target_cfg.get("calibre_mm", 4.5)))
-        _R        = _card_r + _calibre / 2.0
         self.session = Session(
             name=self.cfg["session_name"],
             shots_per_series=self.cfg["shots_per_series"],
-            scoring_radius_mm=_R,
+            scoring_radius_mm=_compute_scoring_radius_mm(
+                self.target_cfg, self.cfg),
         )
-        self._apply_session_cfg()  # wire cfg into session at startup
+        self._apply_session_cfg()
         self.tracker = ArucoTracker(
             aruco_dict_name=self.cfg.get("aruco_dict", "DICT_4X4_50"),
             marker_size_mm=float(self.cfg.get("aruco_marker_mm", 40.0)),
@@ -70,25 +75,26 @@ class SplattApp:
         )
         self.target_renderer = None
 
+        # ~12 ms chunks keep latency low while still capturing the click.
         self.audio = AudioDetector(
             threshold=self.cfg.get("audio_trigger_threshold", 0.15),
             transient_ratio=self.cfg.get("audio_transient_ratio", 6.0),
             cooldown_ms=self.cfg.get("audio_trigger_cooldown_ms", 800),
             sample_rate=self.cfg.get("audio_sample_rate", 44100),
-            chunk_size=512,          # ~12ms chunks — low latency, still enough for transient detection
+            chunk_size=512,
             device_index=self.cfg.get("audio_device_index"),
             on_shot=self._on_shot_detected,
         )
 
-        # State
+        # Camera and tracking state.
         self._cap = None
         self._running = False
         self._paused = False
         self._shot_queue = queue.Queue()
-        self._current_aim_mm  = None
-        self._raw_aim_prev     = None   # previous raw position (pre-smoother)
-        self._raw_aim_prev2    = None   # two frames ago (for velocity reversal)
-        self._spike_hold       = None   # buffered position during spike candidate
+        self._current_aim_mm = None
+        self._raw_aim_prev = None
+        self._raw_aim_prev2 = None
+        self._spike_hold = None
         self._tracking_quality = 0.0
         self._zero_offset = (
             float(self.cfg.get("zero_offset_x", 0.0)),
@@ -96,53 +102,55 @@ class SplattApp:
         )
         self._zero_mode = False
         self._decimal_scoring = self.cfg.get("decimal_scoring", False)
-        self._zoom_factor      = 1.0   # target canvas zoom (0.3–1.5)
-        self._live_fps         = 0.0   # measured camera FPS
-        self._sharpness        = 0.0   # Laplacian variance (focus measure)
-        self._sharpness_peak   = 0.0   # peak hold
-        self._sharpness_peak_t = 0.0   # time of peak
+        self._zoom_factor = 1.0
+        self._live_fps = 0.0
+        self._sharpness = 0.0
+        self._sharpness_peak = 0.0
+        self._sharpness_peak_t = 0.0
+
+        # Display toggles.
         self._show_acp = True
         self._show_bbox_shots = False
         self._show_bbox_acp = False
-        self._show_group = False    # show group circle (blue) and MPI cross
+        self._show_group = False
+        self._shot_dot_only = False
         self._highlighted_trace: ShotTrace = None
         self._on_target_status = False
         self._in_approach_zone = False
+
+        # Series and shot state.
         self._series_started = False
-        self._post_shot_cooldown_s = float(self.cfg.get("post_shot_cooldown_s", 2.0))
+        self._post_shot_cooldown_s = float(
+            self.cfg.get("post_shot_cooldown_s", 2.0))
         self._last_shot_fired_time: float = 0.0
         self._last_shot_info = None
-        self._current_markers_found: int = 0   # updated every camera frame
+        self._current_markers_found: int = 0
         self._camera_rotation = int(self.cfg.get("camera_rotation", 0))
-        self._fine_zero_mode = False   # click-on-canvas zero fine-tune
-        self._shot_dot_only = False       # True=dot, False=full circle
+        self._fine_zero_mode = False
         self._smoother = make_smoother(
             self.cfg.get("smooth_mode", "ema"),
             alpha=self.cfg.get("smooth_alpha", 0.35),
             window=self.cfg.get("smooth_window", 11),
             poly=self.cfg.get("smooth_poly", 2),
         )
-        self._selected_shot: Shot = None   # for shot log selection
+        self._selected_shot: Shot = None
         self._latest_cam_frame = None
 
-        # Series editor state
+        # Series editor state. ``BooleanVar``s need a root, so they're
+        # bound after ``_build_window`` runs.
         self._in_series_editor = False
-        self._editor_shot_vars = {}      # shot.index -> BooleanVar
-        # BooleanVars must be created AFTER the root window exists
+        self._editor_shot_vars = {}
         self._editor_show_trace = None
-        self._editor_show_acp   = None
-        self._editor_show_dur   = None
+        self._editor_show_acp = None
+        self._editor_show_dur = None
 
-        self._build_window()   # creates self.root
-        # Start update loop — runs always, not just when camera active
+        self._build_window()
         self.root.after(100, self._update_loop)
-        # First-run wizard — shown after window is ready
         if self._first_run:
             self.root.after(300, self._show_first_run_wizard)
-        # Now safe to create tk variables
         self._editor_show_trace = tk.BooleanVar(value=True)
-        self._editor_show_acp   = tk.BooleanVar(value=True)
-        self._editor_show_dur   = tk.BooleanVar(value=True)
+        self._editor_show_acp = tk.BooleanVar(value=True)
+        self._editor_show_dur = tk.BooleanVar(value=True)
         self._apply_styles()
     def _build_window(self):
         self.root = tk.Tk()
@@ -757,15 +765,8 @@ class SplattApp:
         self._shot_queue.put(ts)
 
     def _scoring_radius_mm(self) -> float:
-        """
-        R = card_radius + pellet_radius.
-        This is the single number that drives all scoring geometry.
-        Changing calibre in settings instantly changes all scoring bands.
-        """
-        card_r    = self.target_cfg["diameter_mm"] / 2.0
-        calibre   = float(self.cfg.get("scoring_calibre_mm",
-                          self.target_cfg.get("calibre_mm", 4.5)))
-        return card_r + calibre / 2.0
+        """Scoring radius derived from the target card and pellet calibre."""
+        return _compute_scoring_radius_mm(self.target_cfg, self.cfg)
 
     def _register_shot(self, aim_mm, shot_ts: float = None):
         if not self._series_started:
