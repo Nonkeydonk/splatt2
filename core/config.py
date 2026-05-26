@@ -5,19 +5,31 @@ All user-configurable settings and target definitions.
 
 import json
 import os
+import shutil
 
-from core.paths import resource_path
+from core.paths import config_path, resource_path
 
 VERSION = "1.1.0"
 
-def _config_path() -> str:
-    """Config file lives in the project root (next to main.py)."""
-    import os
-    base = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(base)  # up from core/ to project root
-    return os.path.join(base, "splatt2_config.json")
+CONFIG_FILE = str(config_path())
 
-CONFIG_FILE = _config_path()
+
+def _migrate_legacy_config() -> None:
+    """Copy a pre-1.2 config sitting next to main.py into the user dir."""
+    if os.path.exists(CONFIG_FILE):
+        return
+    legacy = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "splatt2_config.json")
+    if os.path.isfile(legacy):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+            shutil.copy2(legacy, CONFIG_FILE)
+            print(f"[Config] Migrated legacy config -> {CONFIG_FILE}")
+        except OSError as e:
+            print(f"[Config] Could not migrate legacy config: {e}")
+
+
+_migrate_legacy_config()
 
 # ── Target definitions — loaded from targets/ folder ────────────────────────
 # Each .csv in the targets/ folder defines one target.
@@ -244,6 +256,7 @@ def load_config():
 
 def save_config(cfg: dict):
     try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
