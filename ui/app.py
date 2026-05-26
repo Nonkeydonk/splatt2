@@ -586,41 +586,58 @@ class SplattApp:
         if self._running:
             self._stop_camera()
             return
+
         idx = self.cfg.get("camera_index", 0)
-        self._cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not self._cap.isOpened():
-            self._cap = cv2.VideoCapture(idx)
-        if not self._cap.isOpened():
-            messagebox.showerror("Camera Error",
-                                  f"Cannot open camera {idx}. Try another index.")
+        cap = self._open_capture(idx)
+        if cap is None:
+            messagebox.showerror(
+                "Camera Error",
+                f"Cannot open camera {idx}. Try another index.")
             return
-        w = int(self.cfg.get("video_width", 640))
-        h = int(self.cfg.get("video_height", 480))
+
+        self._cap = cap
         target_fps = int(self.cfg.get("video_fps", 30))
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        self._cap.set(cv2.CAP_PROP_FPS, target_fps)
-        # Pixel format — MJPEG prevents static-scene frame rate throttling
-        _fmt = self.cfg.get("camera_pixel_format", "Auto")
-        if _fmt == "MJPEG":
-            _accepted = self._cap.set(cv2.CAP_PROP_FOURCC,
-                                      cv2.VideoWriter.fourcc('M','J','P','G'))
-            _rb = int(self._cap.get(cv2.CAP_PROP_FOURCC))
-            _rb_str = ''.join([chr((_rb >> (8*i)) & 0xFF) for i in range(4)])
-            print(f"[Camera] MJPEG requested — fourcc readback: {_rb_str!r}")
-        elif _fmt == "YUY2":
-            self._cap.set(cv2.CAP_PROP_FOURCC,
-                          cv2.VideoWriter.fourcc('Y','U','Y','2'))
-        # Minimise buffer — always get freshest frame, never queue up stale ones
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        self._configure_capture(cap, target_fps)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
         self._camera_fps = actual_fps if actual_fps > 0 else target_fps
+
         self._running = True
         self._btn_cam.config(text="■  Stop Camera", bg=ACCENT2, fg=BG_DARK)
         self._set_status("LIVE", ACCENT)
         self.audio.start()
         threading.Thread(target=self._camera_loop, daemon=True).start()
-        # _update_loop is already running (started at init); no need to restart
+
+    @staticmethod
+    def _open_capture(idx: int):
+        """Open the camera, preferring DirectShow on Windows, then default."""
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            return cap
+        cap = cv2.VideoCapture(idx)
+        return cap if cap.isOpened() else None
+
+    def _configure_capture(self, cap, target_fps: int) -> None:
+        """Apply resolution, FPS, pixel format and buffer settings."""
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.cfg.get("video_width", 640)))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.cfg.get("video_height", 480)))
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
+        self._apply_pixel_format(cap)
+        # BUFFERSIZE=1 ensures cap.read() always returns the freshest frame
+        # rather than queueing up stale ones.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    def _apply_pixel_format(self, cap) -> None:
+        """Optionally request MJPEG/YUY2 to avoid static-scene FPS throttling."""
+        fmt = self.cfg.get("camera_pixel_format", "Auto")
+        if fmt == "MJPEG":
+            cap.set(cv2.CAP_PROP_FOURCC,
+                    cv2.VideoWriter.fourcc("M", "J", "P", "G"))
+            readback = int(cap.get(cv2.CAP_PROP_FOURCC))
+            chars = "".join(chr((readback >> (8 * i)) & 0xFF) for i in range(4))
+            print(f"[Camera] MJPEG requested — fourcc readback: {chars!r}")
+        elif fmt == "YUY2":
+            cap.set(cv2.CAP_PROP_FOURCC,
+                    cv2.VideoWriter.fourcc("Y", "U", "Y", "2"))
 
     def _stop_camera(self):
         self._running = False
