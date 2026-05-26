@@ -43,24 +43,29 @@ def _arch_tag() -> str:
 
 
 def _rename_output(target_name: str) -> Path:
-    """Move PyInstaller's per-OS output into dist/splatt2-<os>-<arch>/.
+    """Stage the platform-specific output under dist/splatt2-<os>-<arch>/.
 
-    On macOS the BUNDLE step produces ``dist/Splatt2.app`` — the artifact
-    end users actually launch. It's moved inside the target folder so
-    every platform produces a single zippable directory.
+    On macOS the launchable artifact is ``dist/Splatt2.app`` produced by
+    the BUNDLE step; the loose COLLECT directory only duplicates what's
+    already inside the bundle, so it's dropped. On Windows and Linux
+    the COLLECT directory IS the artifact.
     """
     src = DIST / "splatt2"
     dst = DIST / target_name
     if dst.exists():
         shutil.rmtree(dst)
-    if src.exists():
-        src.rename(dst)
 
     if sys.platform == "darwin":
+        dst.mkdir(parents=True, exist_ok=True)
         app = DIST / "Splatt2.app"
         if app.exists():
-            dst.mkdir(parents=True, exist_ok=True)
             shutil.move(str(app), str(dst / "Splatt2.app"))
+        if src.exists():
+            shutil.rmtree(src)
+    else:
+        if src.exists():
+            src.rename(dst)
+
     return dst
 
 
