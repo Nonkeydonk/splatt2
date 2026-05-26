@@ -62,6 +62,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=icon_arg,
+    contents_directory=".",
 )
 
 coll = COLLECT(
