@@ -144,11 +144,6 @@ class SplattApp:
         self._editor_show_acp   = tk.BooleanVar(value=True)
         self._editor_show_dur   = tk.BooleanVar(value=True)
         self._apply_styles()
-
-    # =========================================================================
-    # WINDOW BUILD
-    # =========================================================================
-
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title(f"SPLATT2 v{VERSION} — Target Shooting Trainer")
@@ -205,8 +200,6 @@ class SplattApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<KeyPress>", self._on_key)
-
-    # ── Camera panel ──────────────────────────────────────────────────────────
     def _build_camera_panel(self, parent):
         tk.Label(parent, text="CAMERA FEED", bg=BG_PANEL, fg=TEXT_DIM,
                  font=FL).pack(anchor="nw", padx=8, pady=(6, 0))
@@ -264,8 +257,6 @@ class SplattApp:
         self._btn_cam.pack(side="left")
         _mk_btn(cf, "⚙  Settings", self._open_settings).pack(side="right")
         _mk_btn(cf, "🎛  Cam Props", self._open_camera_properties).pack(side="right", padx=4)
-
-    # ── Target panel ──────────────────────────────────────────────────────────
     def _build_target_panel(self, parent):
         tk.Label(parent, text="TARGET", bg=BG_PANEL, fg=TEXT_DIM,
                  font=FL).pack(anchor="nw", padx=8, pady=(6, 0))
@@ -286,8 +277,6 @@ class SplattApp:
         self._aim_lbl = tk.Label(info, text="Aim: — mm",
                                  bg=BG_PANEL, fg=TEXT_DIM, font=FM)
         self._aim_lbl.pack(side="right")
-
-    # ── Score panel ───────────────────────────────────────────────────────────
     def _build_score_panel(self, parent):
         # Score card
         sc = tk.Frame(parent, bg=BG_CARD)
@@ -424,8 +413,6 @@ class SplattApp:
         tk.Frame(bf, bg=BG_PANEL, height=3).pack()
         _mk_btn(bf, "⊞  Marker Sheet", self._print_markers).pack(fill="x", pady=1)
         _mk_btn(bf, "💾  Save CSV",     self._save_csv).pack(fill="x", pady=1)
-
-    # ── Bottom bar ────────────────────────────────────────────────────────────
     def _build_bottom_bar(self, parent):
         _mk_btn(parent, "❙❙  Pause", self._toggle_pause).pack(
             side="left", padx=(8, 3), pady=5)
@@ -516,11 +503,6 @@ class SplattApp:
                     padding=[8, 3])
         s.map("TNotebook.Tab", background=[("selected", BG_PANEL)],
               foreground=[("selected", ACCENT)])
-
-    # =========================================================================
-    # CAMERA
-    # =========================================================================
-
     def _scan_cameras(self):
         self._cam_combo.config(state="disabled")
         self._cam_combo["values"] = ["Scanning..."]
@@ -679,7 +661,6 @@ class SplattApp:
                 zeroed = (raw[0] - self._zero_offset[0],
                           raw[1] - self._zero_offset[1])
                 if result.quality >= 0.25:
-                    # ── Velocity spike filter (raw positions, pre-smoother) ──
                     # Detects bad homography spikes: a large jump that immediately
                     # reverses. Genuine fast movement (recoil, swing) continues
                     # in the same direction — it does not sharply reverse.
@@ -868,11 +849,6 @@ class SplattApp:
             self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC),
             self._set_status("ZEROED", ACCENT)
         ))
-
-    # =========================================================================
-    # UPDATE LOOP
-    # =========================================================================
-
     def _update_loop(self):
         # Target display and scores run always (even without camera)
         # so colour changes / shot edits reflect immediately
@@ -1082,11 +1058,6 @@ class SplattApp:
     def _update_audio_meter(self):
         level = min(1.0, self.audio.current_level * 12)
         self._audio_var.set(level * 100)
-
-    # =========================================================================
-    # CONTROLS
-    # =========================================================================
-
     def _on_exp_mode(self):
         """Auto exposure checkbox changed — apply live."""
         if hasattr(self, '_exp_auto_var'):
@@ -1478,8 +1449,6 @@ class SplattApp:
 
     def _set_status(self, text, color=TEXT_SEC):
         self._status_lbl.config(text=f"● {text}", fg=color)
-
-    # ── Shot log interactions ─────────────────────────────────────────────────
     def _shot_at_log_line(self, event):
         try:
             line_no = int(self._shot_log.index(
@@ -1595,11 +1564,6 @@ class SplattApp:
             if self._selected_shot and self._selected_shot.index == shot.index:
                 self._selected_shot = None
                 self._highlighted_trace = None
-
-    # =========================================================================
-    # SERIES COMPLETE EDITOR
-    # =========================================================================
-
     def _series_complete(self):
         """Finish shooting, save, enter review mode."""
         # End live file (also writes JSON)
@@ -1746,11 +1710,6 @@ class SplattApp:
     def _editor_select_all(self, value: bool):
         for var in self._editor_shot_vars.values():
             var.set(value)
-
-    # =========================================================================
-    # KEYBOARD
-    # =========================================================================
-
     def _on_key(self, event):
         k = event.keysym.lower()
         if k == "p":         self._toggle_pause()
@@ -1758,11 +1717,6 @@ class SplattApp:
         elif k == "r":       self._reset_all()
         elif k == "q":       self._on_close()
         elif k == "s":       self._save_csv()
-
-    # =========================================================================
-    # LIFECYCLE
-    # =========================================================================
-
     def _on_close(self):
         self._running = False
         self.audio.stop()
@@ -1863,11 +1817,6 @@ class SplattApp:
 
     def run(self):
         self.root.mainloop()
-
-
-# =============================================================================
-# SETTINGS DIALOG
-# =============================================================================
 
 class MarkerSheetDialog(tk.Toplevel):
     def __init__(self, parent, cfg):
@@ -2056,15 +2005,10 @@ class MarkerSheetDialog(tk.Toplevel):
         except Exception:
             pass
         self.destroy()
-
-    # ── Target Creator tab ────────────────────────────────────────────────────
-
     def _build_creator_tab(self, parent):
         """Target editor — create, edit and delete targets from the targets/ folder."""
         from core.config import TARGETS, _targets_dir
         pad = {"padx": 10, "pady": 3}
-
-        # ── Mode selector: New or edit existing ──────────────────────────────
         top = tk.Frame(parent, bg=BG_DARK); top.pack(fill="x", **pad)
         tk.Label(top, text="Mode:", bg=BG_DARK, fg=TEXT_SEC,
                  font=FB, width=8, anchor="w").pack(side="left")
@@ -2078,8 +2022,6 @@ class MarkerSheetDialog(tk.Toplevel):
         tk.Button(top, text="Delete", command=self._delete_target,
                   bg=ACCENT2, fg=BG_DARK, font=FL, relief="flat",
                   padx=6, pady=3, cursor="hand2").pack(side="left")
-
-        # ── Metadata fields ───────────────────────────────────────────────────
         meta = tk.Frame(parent, bg=BG_DARK); meta.pack(fill="x", **pad)
 
         def _field(frame, label, var, width=20):
@@ -2137,8 +2079,6 @@ class MarkerSheetDialog(tk.Toplevel):
         # Trace changes to update live preview
         for v in (self._c_calibre, self._c_card):
             v.trace_add("write", lambda *_: self._update_creator_preview())
-
-        # ── Ring data text area ───────────────────────────────────────────────
         tk.Label(parent,
                  text="Visual rings — score, ring_diameter_mm (innermost first):",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(anchor="nw", padx=10, pady=(4,1))
@@ -2152,14 +2092,10 @@ class MarkerSheetDialog(tk.Toplevel):
             "10, 0.5\n9, 5.5\n8, 10.5\n7, 15.5\n6, 20.5\n"
             "5, 25.5\n4, 30.5\n3, 35.5\n2, 40.5\n1, 45.5")
         self._c_rings_txt.bind("<KeyRelease>", lambda *_: self._update_creator_preview())
-
-        # ── Live scoring preview ──────────────────────────────────────────────
         self._c_preview = tk.Label(parent, text="", bg=BG_CARD, fg=ACCENT,
                                     font=("Consolas", 9), justify="left",
                                     anchor="nw", padx=8, pady=4)
         self._c_preview.pack(fill="x", padx=10, pady=(0,2))
-
-        # ── Status + buttons ─────────────────────────────────────────────────
         self._c_status = tk.Label(parent, text="", bg=BG_DARK, fg=ACCENT,
                                    font=FM, anchor="w")
         self._c_status.pack(fill="x", padx=10)
@@ -2352,11 +2288,6 @@ class MarkerSheetDialog(tk.Toplevel):
         self._c_status.config(
             text=f"Saved '{name}' → {fname}  (available immediately)",
             fg=ACCENT)
-
-# =============================================================================
-# SESSION HISTORY WINDOW
-# =============================================================================
-
 class SessionHistoryWindow(tk.Toplevel):
     def __init__(self, parent, save_dir, cfg):
         super().__init__(parent)
@@ -2520,16 +2451,6 @@ class SessionHistoryWindow(tk.Toplevel):
         self._tgt._img = photo
 
 
-# =============================================================================
-# SERIES REVIEW WINDOW
-# =============================================================================
-
-
-
-# =============================================================================
-# SETTINGS DIALOG  (scrollable tabs, resizable)
-# =============================================================================
-
 class SettingsDialog(tk.Toplevel):
     """Scrollable settings dialog — each tab has a canvas+scrollbar so nothing
     is ever clipped regardless of screen size or font scaling."""
@@ -2545,9 +2466,6 @@ class SettingsDialog(tk.Toplevel):
         self.geometry("560x680")
         self.minsize(480, 500)
         self._build()
-
-    # ── shell ─────────────────────────────────────────────────────────────────
-
     def _build(self):
         # Fixed button row at BOTTOM (always visible)
         btn_row = tk.Frame(self, bg=BG_DARK)
@@ -2606,9 +2524,6 @@ class SettingsDialog(tk.Toplevel):
             builder(inner)
             # Force scroll region now that content is populated
             self.after(50, _refresh)
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
     def _row(self, parent, label, widget_fn):
         r = tk.Frame(parent, bg=BG_DARK)
         r.pack(fill="x", padx=12, pady=4)
@@ -2638,9 +2553,6 @@ class SettingsDialog(tk.Toplevel):
         setattr(self, f"_v_{key}", v)
         return ttk.Combobox(parent, textvariable=v, values=values,
                              width=18, state="readonly", font=FM)
-
-    # ── Camera tab ────────────────────────────────────────────────────────────
-
     def _build_cam(self, tab):
         self._section(tab, "Camera")
         self._row(tab, "Camera index", lambda p: self._entry(p, "camera_index", 4))
@@ -2837,9 +2749,6 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
         tk.Frame(tab, bg=BG_DARK, height=16).pack()   # bottom padding
-
-    # ── Audio tab ─────────────────────────────────────────────────────────────
-
     def _build_audio(self, tab):
         self._section(tab, "Shot Detection")
         self._note(tab, "Threshold: absolute peak floor (0.01–1.0)\n"
@@ -2860,9 +2769,6 @@ class SettingsDialog(tk.Toplevel):
                  ).pack(anchor="nw", padx=16)
         self._row(tab, "Device index (blank=auto)", lambda p: self._entry(p, "audio_device_index", 4))
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
-
-    # ── Target tab ────────────────────────────────────────────────────────────
-
     def _build_target(self, tab):
         self._section(tab, "Target & Range")
         self._row(tab, "Target type",
@@ -2946,11 +2852,6 @@ class SettingsDialog(tk.Toplevel):
                   bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
                   padx=6, pady=3, cursor="hand2").pack(side="left", padx=2)
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
-
-    # ── Collect / Apply ───────────────────────────────────────────────────────
-
-    # ── Colours & Display tab ────────────────────────────────────────────────
-
     def _build_colours(self, tab):
         self._note(tab, "Click a swatch to pick a colour. Changes apply on Apply.")
 
@@ -3038,9 +2939,6 @@ class SettingsDialog(tk.Toplevel):
         tk.Button(r, text="Pick…", command=_pick,
                   bg=BG_CARD, fg=TEXT_SEC, font=FL, relief="flat",
                   padx=6, pady=2, cursor="hand2").pack(side="left", padx=(4, 0))
-
-    # ── Advanced tab ──────────────────────────────────────────────────────────
-
     def _build_advanced(self, tab):
         self._section(tab, "Shooter Profile")
         self._row(tab, "Shooter name",
@@ -3208,11 +3106,6 @@ class SettingsDialog(tk.Toplevel):
         else:
             self._cam_caps_lbl.config(text="No modes found")
 
-
-# =============================================================================
-# SERIES REVIEW WINDOW  (series picker, working toggles, scrollable shot list)
-# =============================================================================
-
 class SeriesReviewWindow(tk.Toplevel):
     """
     Review window with:
@@ -3257,13 +3150,7 @@ class SeriesReviewWindow(tk.Toplevel):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, self._init_renderer)
-
-    # =========================================================================
-    # BUILD
-    # =========================================================================
-
     def _build(self):
-        # ── Top bar: two-dropdown day / series picker ───────────────────────
         top = tk.Frame(self, bg=BG_MID)
         top.pack(side="top", fill="x")
 
@@ -3289,8 +3176,6 @@ class SeriesReviewWindow(tk.Toplevel):
 
         self._view_lbl = tk.Label(top, text="", bg=BG_MID, fg=TEXT_DIM, font=FL)
         self._view_lbl.pack(side="right", padx=12)
-
-        # ── Body ─────────────────────────────────────────────────────────────
         body = tk.Frame(self, bg=BG_DARK)
         body.pack(fill="both", expand=True)
 
@@ -3309,7 +3194,6 @@ class SeriesReviewWindow(tk.Toplevel):
         self._build_right(right)
 
     def _build_right(self, parent):
-        # ── Stats ─────────────────────────────────────────────────────────────
         sc = tk.Frame(parent, bg=BG_CARD)
         sc.pack(fill="x", padx=6, pady=(6, 3))
         tk.Label(sc, text="STATISTICS", bg=BG_CARD, fg=TEXT_DIM,
@@ -3336,8 +3220,6 @@ class SeriesReviewWindow(tk.Toplevel):
                              font=FM, anchor="w")
                 v.pack(side="left", padx=(2,8))
                 self._stat_lbls[key] = v
-
-        # ── Display toggles ────────────────────────────────────────────────────
         tc = tk.Frame(parent, bg=BG_PANEL)
         tc.pack(fill="x", padx=6, pady=(0, 4))
         tk.Label(tc, text="DISPLAY", bg=BG_PANEL, fg=TEXT_DIM,
@@ -3364,8 +3246,6 @@ class SeriesReviewWindow(tk.Toplevel):
             btn = self._make_tog_btn(r2, text, var, col)
             btn.pack(side="left", padx=(0, 2))
             self._tog_buttons[key] = btn
-
-        # ── Shot list ──────────────────────────────────────────────────────────
         lc = tk.Frame(parent, bg=BG_CARD)
         lc.pack(fill="both", expand=True, padx=6, pady=(0, 3))
 
@@ -3408,8 +3288,6 @@ class SeriesReviewWindow(tk.Toplevel):
         def _wheel(e):
             self._list_canvas.yview_scroll(int(-1*(e.delta/120)), "units")
         self._list_canvas.bind("<MouseWheel>", _wheel)
-
-        # ── Actions ────────────────────────────────────────────────────────────
         bf = tk.Frame(parent, bg=BG_PANEL)
         bf.pack(fill="x", padx=6, pady=(0, 6))
         tk.Button(bf, text="▶  Next Series",
@@ -3439,11 +3317,6 @@ class SeriesReviewWindow(tk.Toplevel):
                         font=FL, relief="flat", bd=0,
                         padx=6, pady=4, cursor="hand2")
         return btn
-
-    # =========================================================================
-    # SERIES PICKER
-    # =========================================================================
-
     def _populate_series_picker(self):
         """Build the day + series dropdowns from live session and saved files."""
         from core.session import load_session_history
@@ -3561,11 +3434,6 @@ class SeriesReviewWindow(tk.Toplevel):
         self._rebuild_shot_list()
         self._update_stats()
         self._redraw()
-
-    # =========================================================================
-    # SHOT LIST
-    # =========================================================================
-
     def _rebuild_shot_list(self):
         """Rebuild the per-shot checkbox rows for the current view."""
         for w in self._list_inner.winfo_children():
@@ -3639,11 +3507,6 @@ class SeriesReviewWindow(tk.Toplevel):
                 self._shot_chk_vars[shot.index].set(value)
         self._update_stats()
         self._redraw()
-
-    # =========================================================================
-    # RENDERER
-    # =========================================================================
-
     def _init_renderer(self):
         from core.target_renderer import TargetRenderer
         w = self._canvas.winfo_width()
@@ -3699,11 +3562,6 @@ class SeriesReviewWindow(tk.Toplevel):
         else:
             self._canvas.itemconfig(self._tgt_img_id, image=photo)
         self._canvas._img = photo
-
-    # =========================================================================
-    # STATS
-    # =========================================================================
-
     def _update_stats(self):
         visible = [s for s in self._view_session.shots
                    if s.series == self._view_series
@@ -3756,11 +3614,6 @@ class SeriesReviewWindow(tk.Toplevel):
             text=f"#{best.index} {best.score:.1f}", fg=GOLD)
         self._stat_lbls["worst"].config(
             text=f"#{worst.index} {worst.score:.1f}", fg=ACCENT2)
-
-    # =========================================================================
-    # ACTIONS
-    # =========================================================================
-
     def _next_series(self):
         if self.on_next_series:
             self.on_next_series()
