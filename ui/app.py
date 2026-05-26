@@ -1090,34 +1090,57 @@ class SplattApp:
                 text=f"#{last.index} {sc_str}pts ({last.aim_mm[0]:+.1f},{last.aim_mm[1]:+.1f}){acp_s}{ot_s}",
                 fg=GOLD if sc >= 9 else (ACCENT if sc >= 7 else TEXT_SEC))
 
+    @staticmethod
+    def _shot_flags(shot: Shot) -> str:
+        """Compact flag string for the shot log."""
+        flags = ""
+        if not shot.match_shot:
+            flags += "S"
+        if shot.favourite:
+            flags += "★"
+        if shot.missed:
+            flags += "M"
+        if shot.comments:
+            flags += "✎"
+        return flags
+
+    @staticmethod
+    def _shot_log_tag(score: float) -> str:
+        """Colour tag for a shot in the shot log."""
+        if score >= 10:
+            return "ten"
+        if score >= 9:
+            return "nine"
+        if score >= 7:
+            return "mid"
+        if score > 0:
+            return "low"
+        return "miss"
+
     def _refresh_shot_log(self):
         log = self._shot_log
         log.config(state="normal")
         log.delete("1.0", "end")
-        log.insert("end", f"{'#':>3}  {'Sc':>5}  {'X':>6}  {'Y':>6}  {'T':>4}  Flg\n", "hdr")
+        log.insert("end",
+                   f"{'#':>3}  {'Sc':>5}  {'X':>6}  {'Y':>6}  {'T':>4}  Flg\n",
+                   "hdr")
         log.insert("end", "─" * 38 + "\n", "hdr")
-        shots_rev = list(reversed(self.session.shots[-40:]))
-        for shot in shots_rev:
+
+        for shot in reversed(self.session.shots[-40:]):
             if shot.deleted:
-                continue   # don't show deleted shots in log
-            sc   = shot.score
-            sc_s = f"{sc:.1f}" if sc != int(sc) else str(int(sc))
-            ot   = f"{shot.on_target_duration_s:.1f}"
-            # Build flag string
-            flags = ""
-            if not shot.match_shot: flags += "S"   # S = Sighter
-            if shot.favourite:      flags += "★"
-            if shot.missed:         flags += "M"
-            if shot.comments:       flags += "✎"
-            line = (f"{shot.index:>3}  {sc_s:>5}  "
-                    f"{shot.aim_mm[0]:>+6.1f}  {shot.aim_mm[1]:>+6.1f}  "
-                    f"{ot:>4}  {flags}\n")
-            tag  = ("ten"  if sc >= 10 else "nine" if sc >= 9 else
-                    "mid"  if sc >= 7  else "low"  if sc > 0  else "miss")
+                continue
+            score = shot.score
+            score_str = (f"{score:.1f}" if score != int(score)
+                         else str(int(score)))
+            line = (
+                f"{shot.index:>3}  {score_str:>5}  "
+                f"{shot.aim_mm[0]:>+6.1f}  {shot.aim_mm[1]:>+6.1f}  "
+                f"{shot.on_target_duration_s:>4.1f}  {self._shot_flags(shot)}\n"
+            )
             if self._selected_shot and self._selected_shot.index == shot.index:
                 log.insert("end", line, ("sel", "sel_bg"))
             else:
-                log.insert("end", line, tag)
+                log.insert("end", line, self._shot_log_tag(score))
         log.config(state="disabled")
 
     def _update_audio_meter(self):
