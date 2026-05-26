@@ -1233,30 +1233,32 @@ class SplattApp:
                                     bg=BG_CARD if self._camera_rotation == 0 else ACCENT,
                                     fg=TEXT_SEC if self._camera_rotation == 0 else BG_DARK)
 
+    def _set_toggle_button(self, button: tk.Button, active: bool) -> None:
+        """Apply the standard accent/idle styling to a toggle button."""
+        button.config(
+            bg=ACCENT if active else BG_CARD,
+            fg=BG_DARK if active else TEXT_SEC,
+        )
+
     def _toggle_acp(self):
         self._show_acp = not self._show_acp
-        self._btn_acp.config(bg=ACCENT if self._show_acp else BG_CARD,
-                              fg=BG_DARK if self._show_acp else TEXT_SEC)
+        self._set_toggle_button(self._btn_acp, self._show_acp)
 
     def _toggle_bbox_shots(self):
         self._show_bbox_shots = not self._show_bbox_shots
-        self._btn_bbox_s.config(bg=ACCENT if self._show_bbox_shots else BG_CARD,
-                                 fg=BG_DARK if self._show_bbox_shots else TEXT_SEC)
+        self._set_toggle_button(self._btn_bbox_s, self._show_bbox_shots)
 
     def _toggle_bbox_acp(self):
         self._show_bbox_acp = not self._show_bbox_acp
-        self._btn_bbox_a.config(bg=ACCENT if self._show_bbox_acp else BG_CARD,
-                                 fg=BG_DARK if self._show_bbox_acp else TEXT_SEC)
+        self._set_toggle_button(self._btn_bbox_a, self._show_bbox_acp)
 
     def _toggle_dot_mode(self):
         self._shot_dot_only = not self._shot_dot_only
-        self._btn_dot.config(bg=ACCENT if self._shot_dot_only else BG_CARD,
-                              fg=BG_DARK if self._shot_dot_only else TEXT_SEC)
+        self._set_toggle_button(self._btn_dot, self._shot_dot_only)
 
     def _toggle_group(self):
         self._show_group = not self._show_group
-        self._btn_group.config(bg=ACCENT if self._show_group else BG_CARD,
-                                fg=BG_DARK if self._show_group else TEXT_SEC)
+        self._set_toggle_button(self._btn_group, self._show_group)
 
     def _undo_shot(self):
         shot = self.session.undo_last_shot()
