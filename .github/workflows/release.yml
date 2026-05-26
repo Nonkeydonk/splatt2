@@ -27,9 +27,9 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: splatt2-linux-x64
-          - os: macos-latest
+          - os: macos-26
             artifact: splatt2-macos-arm64
-          - os: macos-13
+          - os: macos-26-intel
             artifact: splatt2-macos-x64
           - os: windows-latest
             artifact: splatt2-windows-x64
