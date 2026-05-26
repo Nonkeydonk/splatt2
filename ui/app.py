@@ -63,10 +63,10 @@ def _mk_btn(parent, text, cmd, accent=False, width=None):
 
 
 def _default_save_dir() -> str:
-    """sessions/ subfolder in the project root (next to main.py)."""
+    """Per-user sessions/ folder. Falls back to ~/Documents/Splatt2 on error."""
     try:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(base, "sessions")
+        from core.paths import sessions_dir
+        return str(sessions_dir())
     except Exception:
         return os.path.join(os.path.expanduser("~"), "Documents", "Splatt2")
 

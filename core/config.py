@@ -243,7 +243,7 @@ DEFAULT_CONFIG = {
     "session_name":       "Session",
     "shooter_name":       "",
     "shots_per_series":   10,
-    "save_directory":     "",    # empty = sessions/ folder next to the app
+    "save_directory":     "",    # empty = sessions/ folder in user data dir
 }
 
 
