@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 import os
 import queue
-import sys
 import threading
 import time
 import tkinter as tk
@@ -3599,7 +3598,6 @@ class SeriesReviewWindow(tk.Toplevel):
                 v.config(text="—", fg=TEXT_SEC)
             return
 
-        import numpy as np
         coords = np.array([s.aim_mm for s in visible])
         radii  = np.sqrt(coords[:,0]**2 + coords[:,1]**2)
         score  = sum(s.score for s in visible)
