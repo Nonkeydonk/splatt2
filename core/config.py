@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 
-from core.paths import config_path, resource_path
+from core.paths import config_path, resource_path, user_targets_dir
 
 VERSION = "1.1.0"
 
@@ -38,8 +38,13 @@ _migrate_legacy_config()
 # Ring diameters are in mm (not radii). Innermost ring first.
 
 def _targets_dir() -> str:
-    """Path to the bundled targets/ folder."""
+    """Path to the bundled targets/ folder (read-only seeds)."""
     return str(resource_path("targets"))
+
+
+def _user_targets_dir() -> str:
+    """Path to the user-writable targets/ folder."""
+    return str(user_targets_dir())
 
 
 def _load_target_csv(path: str) -> dict:
@@ -143,19 +148,21 @@ def _load_target_csv(path: str) -> dict:
     }
 
 def _load_all_targets() -> dict:
-    """Load all .csv files from the targets/ folder. Returns {key: target_dict}."""
-    tdir = _targets_dir()
+    """Load targets from the bundled and user dirs.
+
+    User files override bundled files when keys collide, so a shooter
+    can tweak a built-in target without losing the original.
+    """
     targets = {}
-    if not os.path.isdir(tdir):
-        print(f"[Targets] Folder not found: {tdir}")
-        return targets
-    for fname in sorted(os.listdir(tdir)):
-        if not fname.lower().endswith(".csv"):
+    for tdir in (_targets_dir(), _user_targets_dir()):
+        if not os.path.isdir(tdir):
             continue
-        path = os.path.join(tdir, fname)
-        t = _load_target_csv(path)
-        if t:
-            targets[t["key"]] = t
+        for fname in sorted(os.listdir(tdir)):
+            if not fname.lower().endswith(".csv"):
+                continue
+            t = _load_target_csv(os.path.join(tdir, fname))
+            if t:
+                targets[t["key"]] = t
     return targets
 
 

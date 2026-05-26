@@ -69,3 +69,14 @@ def sessions_dir() -> Path:
     p = user_data_dir() / "sessions"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def user_targets_dir() -> Path:
+    """User-writable targets/ folder, created on first access.
+
+    Bundled targets remain read-only seeds; targets created or edited
+    in-app are written here and merged at load time.
+    """
+    p = user_data_dir() / "targets"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
