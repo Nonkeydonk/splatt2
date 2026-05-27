@@ -241,19 +241,11 @@ class SplattApp:
                                      bg=BG_MID, fg=TEXT_SEC, font=FH)
         self._session_lbl.pack(side="left", padx=8)
         self._status_lbl = tk.Label(top, text="● READY", bg=BG_MID,
-                                    fg=TEXT_SEC, font=("Consolas", 9),
-                                    width=60, anchor="e")
+                                    fg=TEXT_SEC, font=("Consolas", 9))
         self._status_lbl.pack(side="right", padx=16)
         self._tracking_lbl = tk.Label(top, text="TRACKING: —", bg=BG_MID,
-                                      fg=TEXT_DIM, font=("Consolas", 9),
-                                      width=14, anchor="e")
+                                      fg=TEXT_DIM, font=("Consolas", 9))
         self._tracking_lbl.pack(side="right", padx=8)
-        _mk_btn(top, "📋  Series", self._open_series_tab).pack(
-            side="right", padx=4, pady=8)
-        _mk_btn(top, "🖨  Target Sheet", self._print_markers).pack(
-            side="right", padx=4, pady=8)
-        _mk_btn(top, "💾  Save CSV", self._save_csv).pack(
-            side="right", padx=4, pady=8)
 
         # Body
         body = tk.Frame(self.root, bg=BG_DARK)
@@ -454,9 +446,28 @@ class SplattApp:
             id(self._btn_group): GOLD,
         }
 
-        # Shot log
-        lc = tk.Frame(parent, bg=BG_CARD)
+        # Action buttons must be packed before the shot log so the
+        # ``side="bottom"`` slice is reserved first; otherwise the
+        # ``expand=True`` shot log claims all remaining space and the
+        # buttons are pushed below the visible area.
+        bf = tk.Frame(parent, bg=BG_PANEL)
+        bf.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        _mk_btn(bf, "⟲  Undo Shot",    self._undo_shot).pack(fill="x", pady=1)
+        self._btn_start_series = _mk_btn(bf, "▶  Start Series",
+                                              self._start_series, accent=True)
+        self._btn_start_series.pack(fill="x", pady=1)
+        _mk_btn(bf, "📋  Series Review", self._open_series_tab).pack(fill="x", pady=1)
+        _mk_btn(bf, "◻  Reset All",    self._reset_all).pack(fill="x", pady=1)
+        tk.Frame(bf, bg=BG_PANEL, height=3).pack()
+        _mk_btn(bf, "⊞  Marker Sheet", self._print_markers).pack(fill="x", pady=1)
+        _mk_btn(bf, "💾  Save CSV",     self._save_csv).pack(fill="x", pady=1)
+
+        # Shot log. Sized to a fixed minimum height so it stays visible
+        # even when the right column is short; the inner Text widget
+        # then expands into any remaining vertical space.
+        lc = tk.Frame(parent, bg=BG_CARD, height=180)
         lc.pack(fill="both", expand=True, padx=6, pady=(0, 3))
+        lc.pack_propagate(False)
         hdr = tk.Frame(lc, bg=BG_CARD)
         hdr.pack(fill="x", padx=8, pady=(6, 2))
         tk.Label(hdr, text="SHOT LOG", bg=BG_CARD, fg=TEXT_DIM, font=FL).pack(side="left")
@@ -479,19 +490,6 @@ class SplattApp:
                          ("hdr", TEXT_DIM),("sel", ACCENT)]:
             self._shot_log.tag_config(tag, foreground=col)
         self._shot_log.tag_config("sel_bg", background=BG_CARD)
-
-        # Action buttons
-        bf = tk.Frame(parent, bg=BG_PANEL)
-        bf.pack(fill="x", padx=6, pady=(0, 4))
-        _mk_btn(bf, "⟲  Undo Shot",    self._undo_shot).pack(fill="x", pady=1)
-        self._btn_start_series = _mk_btn(bf, "▶  Start Series",
-                                              self._start_series, accent=True)
-        self._btn_start_series.pack(fill="x", pady=1)
-        _mk_btn(bf, "📋  Series Review", self._open_series_tab).pack(fill="x", pady=1)
-        _mk_btn(bf, "◻  Reset All",    self._reset_all).pack(fill="x", pady=1)
-        tk.Frame(bf, bg=BG_PANEL, height=3).pack()
-        _mk_btn(bf, "⊞  Marker Sheet", self._print_markers).pack(fill="x", pady=1)
-        _mk_btn(bf, "💾  Save CSV",     self._save_csv).pack(fill="x", pady=1)
     def _build_bottom_bar(self, parent):
         _mk_btn(parent, "❙❙  Pause", self._toggle_pause).pack(
             side="left", padx=(8, 3), pady=5)
