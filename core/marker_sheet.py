@@ -252,14 +252,29 @@ def generate_marker_sheet(
          f"  Markers: {marker_count}  |  "
          f"Aiming mark: {aiming_dia_scaled:.1f}mm  |  "
          f"Card: {outer_dia_scaled:.1f}mm  |  Markers: {marker:.0f}mm"),
-        "Print at 100% on A4 — NO fit-to-page scaling.",
+        "Print at 100% on A4 - NO fit-to-page scaling.",
         "Verify printed aiming mark diameter with ruler before use.",
     ])
 
-    cv2.imwrite(output_path, img)
+    _save_with_dpi(output_path, img, DPI)
     print(f"[MarkerSheet] Saved: {output_path}  (scale={scale_pct*100:.0f}%, "
           f"aiming mark={aiming_dia_scaled:.1f}mm)")
     return output_path
+
+
+def _save_with_dpi(path: str, img_bgr: np.ndarray, dpi: int) -> None:
+    """Write a PNG/JPEG with the physical print resolution embedded.
+
+    ``cv2.imwrite`` produces a bare bitmap with no DPI tag, so when
+    the file is opened by a print pipeline the page size defaults to
+    whatever DPI the printer assumes (often 72 or 96), producing a
+    sheet several times larger than A4. Round-tripping through PIL
+    lets us write the standard ``pHYs`` chunk for PNG and the JFIF
+    density fields for JPEG.
+    """
+    from PIL import Image
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    Image.fromarray(rgb).save(path, dpi=(dpi, dpi))
 
 
 if __name__ == "__main__":
