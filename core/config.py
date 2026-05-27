@@ -143,6 +143,12 @@ def load_target_csv(path: str) -> Optional[dict]:
     ring_labels = [str(int(s)) if s == int(s) else str(s) for s in scores]
     mark_count = int(meta.get("mark_count", 1))
 
+    # Optional explicit bull diameter for the renderer; targets that
+    # don't set this fall back to the historical "outer 4 rings dark,
+    # inner 6 rings light" rule applied in TargetRenderer.
+    bull_dia = meta.get("bull_dia_mm")
+    bull_dia = float(bull_dia) if bull_dia is not None else None
+
     return {
         "name": meta["name"],
         "key": meta["key"],
@@ -153,6 +159,7 @@ def load_target_csv(path: str) -> Optional[dict]:
         "calibre_mm": float(meta.get("calibre_mm", 4.5)),
         "reference_dist_m": float(meta.get("reference_dist_m", 10.0)),
         "aiming_mark_dia_mm": aiming_dia,
+        "bull_dia_mm": bull_dia,
         "outer_ring_dia_mm": outer_dia,
         "rings_dia_mm": unique_dias,
         "ring_labels": ring_labels,

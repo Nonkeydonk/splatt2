@@ -188,9 +188,6 @@ class TargetRenderer:
         if not mark_offsets:
             self._draw_canvas_crosshair(img)
 
-        approach_r = self.radius_to_px(self.target_cfg["rings_mm"][-1] * 2.0)
-        self._draw_dotted_circle(img, self.cx, self.cy, approach_r,
-                                 colour=(50, 50, 60))
         return img
 
     def _draw_rings(
@@ -198,16 +195,30 @@ class TargetRenderer:
         rings: list, scores: list, label: bool,
     ) -> None:
         n_rings = len(rings)
+        # The "bull" is the lighter-coloured central disc. Targets that
+        # carry an explicit ``bull_dia_mm`` use it directly; everything
+        # else falls back to the historical heuristic of treating the
+        # outer four rings as the dark surround. A bull diameter of 0
+        # means there is no bull — the whole card is dark.
+        bull_dia = self.target_cfg.get("bull_dia_mm")
+        if bull_dia is None:
+            bull_cutoff = n_rings - 4
+            in_bull = lambda i: i < bull_cutoff  # noqa: E731
+        else:
+            limit = float(bull_dia) + 1e-6
+            in_bull = lambda i: rings[i] * 2 <= limit  # noqa: E731
+
         for i in reversed(range(n_rings)):
             r = self.radius_to_px(rings[i])
-            fill = (15, 15, 15) if i >= n_rings - 4 else (240, 240, 240)
+            light = in_bull(i)
+            fill = (240, 240, 240) if light else (15, 15, 15)
             cv2.circle(img, (ocx, ocy), r, fill, -1)
             cv2.circle(img, (ocx, ocy), r, C_RING_OUTER, 1)
             if not label or i >= n_rings - 1:
                 continue
             score = scores[i]
             text = str(int(score)) if score == int(score) else str(score)
-            colour = (200, 200, 200) if i >= n_rings - 4 else (80, 80, 80)
+            colour = (80, 80, 80) if light else (200, 200, 200)
             mid_r = (rings[i] + (rings[i - 1] if i > 0 else 0)) / 2
             lx = int(ocx + mid_r * self.scale * 0.6)
             cv2.putText(img, text, (lx, ocy + 4),
@@ -221,19 +232,6 @@ class TargetRenderer:
                  (40, 40, 45), 1)
         cv2.line(img, (self.cx, self.cy - hl), (self.cx, self.cy + hl),
                  (40, 40, 45), 1)
-
-    @staticmethod
-    def _draw_dotted_circle(
-        img: np.ndarray, cx: int, cy: int, radius: int,
-        colour: Tuple[int, int, int] = (50, 50, 60), n_dashes: int = 48,
-    ) -> None:
-        for i in range(0, n_dashes, 2):
-            a1 = 2 * np.pi * i / n_dashes
-            a2 = 2 * np.pi * (i + 1) / n_dashes
-            for a in np.linspace(a1, a2, 4):
-                px = int(cx + radius * np.cos(a))
-                py = int(cy + radius * np.sin(a))
-                cv2.circle(img, (px, py), 1, colour, -1)
 
     def _draw_shot_trace(
         self, img: np.ndarray, trace: ShotTrace,
