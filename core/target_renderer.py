@@ -24,6 +24,12 @@ C_SHOT_RING = (255, 255, 255)
 C_MPI = (255, 180, 80)
 C_GROUP = (255, 100, 100)
 
+# Supersampling factor for the static target face. Rings, ring labels
+# and the canvas crosshair are drawn this many times larger and then
+# downscaled with INTER_AREA, which avoids the blocky aliasing OpenCV
+# produces when filling small circles directly at canvas resolution.
+_STATIC_SUPERSAMPLE = 3
+
 
 def _hex_to_bgr(value: str) -> Tuple[int, int, int]:
     """Convert ``#rrggbb`` to an OpenCV BGR tuple."""
@@ -172,27 +178,45 @@ class TargetRenderer:
         return max(1, int(r_mm * self.scale))
 
     def _render_static(self) -> np.ndarray:
-        img = np.full((self.ch, self.cw, 3), C_BG, dtype=np.uint8)
+        """Render the static target face once at supersampled resolution.
+
+        Drawing at ``_STATIC_SUPERSAMPLE`` times the canvas resolution
+        and downsampling with ``INTER_AREA`` produces smooth ring edges
+        and legible small text without resorting to a true vector
+        backend. The downscaled image is cached for reuse on every
+        :meth:`render` call.
+        """
+        ss = _STATIC_SUPERSAMPLE
+        big_w, big_h = self.cw * ss, self.ch * ss
+        big = np.full((big_h, big_w, 3), C_BG, dtype=np.uint8)
+
         rings = self.target_cfg["rings_mm"]
         scores = self.target_cfg["ring_scores"]
         mark_offsets = self.target_cfg.get("mark_offsets")
 
+        big_cx, big_cy = self.cx * ss, self.cy * ss
         if mark_offsets:
-            centres = [self.mm_to_px((mx, my)) for mx, my in mark_offsets]
+            centres = [
+                (int(big_cx + mx * self.scale * ss),
+                 int(big_cy + my * self.scale * ss))
+                for mx, my in mark_offsets
+            ]
         else:
-            centres = [(self.cx, self.cy)]
+            centres = [(big_cx, big_cy)]
 
         for ci, (ocx, ocy) in enumerate(centres):
-            self._draw_rings(img, ocx, ocy, rings, scores, label=(ci == 0))
+            self._draw_rings(big, ocx, ocy, rings, scores,
+                             label=(ci == 0), ss=ss)
 
         if not mark_offsets:
-            self._draw_canvas_crosshair(img)
+            self._draw_canvas_crosshair(big, ss=ss)
 
-        return img
+        return cv2.resize(big, (self.cw, self.ch),
+                          interpolation=cv2.INTER_AREA)
 
     def _draw_rings(
         self, img: np.ndarray, ocx: int, ocy: int,
-        rings: list, scores: list, label: bool,
+        rings: list, scores: list, label: bool, ss: int = 1,
     ) -> None:
         n_rings = len(rings)
         # The "bull" is the lighter-coloured central disc. Targets that
@@ -208,30 +232,40 @@ class TargetRenderer:
             limit = float(bull_dia) + 1e-6
             in_bull = lambda i: rings[i] * 2 <= limit  # noqa: E731
 
+        scale_px = self.scale * ss
+        ring_thickness = max(1, ss // 2)
+
         for i in reversed(range(n_rings)):
-            r = self.radius_to_px(rings[i])
+            r = max(1, int(rings[i] * scale_px))
             light = in_bull(i)
             fill = (240, 240, 240) if light else (15, 15, 15)
-            cv2.circle(img, (ocx, ocy), r, fill, -1)
-            cv2.circle(img, (ocx, ocy), r, C_RING_OUTER, 1)
+            cv2.circle(img, (ocx, ocy), r, fill, -1, cv2.LINE_AA)
+            cv2.circle(img, (ocx, ocy), r, C_RING_OUTER,
+                       ring_thickness, cv2.LINE_AA)
             if not label or i >= n_rings - 1:
                 continue
             score = scores[i]
             text = str(int(score)) if score == int(score) else str(score)
             colour = (80, 80, 80) if light else (200, 200, 200)
             mid_r = (rings[i] + (rings[i - 1] if i > 0 else 0)) / 2
-            lx = int(ocx + mid_r * self.scale * 0.6)
-            cv2.putText(img, text, (lx, ocy + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1, cv2.LINE_AA)
+            lx = int(ocx + mid_r * scale_px * 0.6)
+            ly = int(ocy + 4 * ss)
+            cv2.putText(img, text, (lx, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35 * ss, colour,
+                        max(1, ss // 2), cv2.LINE_AA)
         cv2.circle(img, (ocx, ocy),
-                   max(2, self.radius_to_px(0.5)), (0, 0, 0), -1)
+                   max(2 * ss, int(0.5 * scale_px)),
+                   (0, 0, 0), -1, cv2.LINE_AA)
 
-    def _draw_canvas_crosshair(self, img: np.ndarray) -> None:
-        hl = min(self.cw, self.ch) // 2
-        cv2.line(img, (self.cx - hl, self.cy), (self.cx + hl, self.cy),
-                 (40, 40, 45), 1)
-        cv2.line(img, (self.cx, self.cy - hl), (self.cx, self.cy + hl),
-                 (40, 40, 45), 1)
+    def _draw_canvas_crosshair(self, img: np.ndarray, ss: int = 1) -> None:
+        h, w = img.shape[:2]
+        cx, cy = self.cx * ss, self.cy * ss
+        hl = min(w, h) // 2
+        thickness = max(1, ss // 2)
+        cv2.line(img, (cx - hl, cy), (cx + hl, cy),
+                 (40, 40, 45), thickness, cv2.LINE_AA)
+        cv2.line(img, (cx, cy - hl), (cx, cy + hl),
+                 (40, 40, 45), thickness, cv2.LINE_AA)
 
     def _draw_shot_trace(
         self, img: np.ndarray, trace: ShotTrace,
