@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -59,6 +60,22 @@ _ROTATION_FLAGS = {
     180: cv2.ROTATE_180,
     270: cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
+
+
+def _camera_backend() -> int:
+    """OpenCV capture backend appropriate for the current platform.
+
+    Hardcoding ``CAP_DSHOW`` (DirectShow, Windows-only) on macOS or
+    Linux causes ``cv2.VideoCapture`` to hang or block while OpenCV
+    walks through fallbacks, which freezes the UI thread.
+    """
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
 
 
 class _FpsCounter:
@@ -126,6 +143,17 @@ class SplattApp:
         self._cap = None
         self._running = False
         self._paused = False
+        # Set whenever no camera loop is running. The loop clears it
+        # while alive and sets it again on exit, after releasing the
+        # capture device. Re-opens block on this event so the new
+        # session never races the previous one's teardown.
+        self._loop_done = threading.Event()
+        self._loop_done.set()
+        # Coalescing flag: the camera worker sets this to request a UI
+        # repaint, the Tk thread clears it once it has rendered. This
+        # avoids piling up per-frame ``root.after`` calls when the UI
+        # cannot keep pace with capture.
+        self._cam_refresh_pending = False
         self._shot_queue = queue.Queue()
         self._current_aim_mm = None
         self._raw_aim_prev = None
@@ -181,7 +209,11 @@ class SplattApp:
         self._editor_show_dur = None
 
         self._build_window()
-        self.root.after(100, self._update_loop)
+        # Score, target trace and audio refreshes run on a slow timer
+        # so the UI thread is mostly idle and stays responsive to
+        # native events like dropdown clicks. Camera frame display is
+        # driven directly from the worker via ``_request_cam_refresh``.
+        self.root.after(100, self._tick_periodic)
         if self._first_run:
             self.root.after(300, self._show_first_run_wizard)
         self._editor_show_trace = tk.BooleanVar(value=True)
@@ -544,35 +576,48 @@ class SplattApp:
         """Apply the dark ttk + tk option-database theme to the root."""
         _apply_theme(self.root)
     def _scan_cameras(self):
+        """Probe available cameras off the UI thread.
+
+        On macOS each ``VideoCapture(idx, AVFOUNDATION)`` can block for
+        a second or more (permissions, device enumeration), so doing
+        this on the Tk thread freezes the entire app. The scan runs in
+        a daemon thread and posts results back via ``root.after``.
+        """
         self._cam_combo.config(state="disabled")
         self._cam_combo["values"] = ["Scanning..."]
         self._cam_var.set("Scanning...")
-        self.root.after(10, self._do_scan)
+        threading.Thread(target=self._scan_in_background,
+                         daemon=True).start()
 
-    @staticmethod
-    def _probe_camera(idx: int):
-        """Return ``(width, height)`` for the camera at ``idx`` if openable."""
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        try:
-            if not cap.isOpened():
-                return None
-            return (
-                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-            )
-        finally:
-            cap.release()
+    def _scan_in_background(self) -> None:
+        """Probe camera indices until a gap suggests we're past the last one.
 
-    def _do_scan(self):
+        macOS exposes a dense index range, so two consecutive failures
+        is a reliable stop signal that avoids the noisy AVFoundation
+        "out of bounds" warnings. On Windows/Linux indices can be
+        sparse, so we still probe up to 8.
+        """
+        max_indices = 8
+        max_consecutive_misses = 8 if sys.platform != "darwin" else 2
+
         found = []
-        for i in range(8):
+        misses = 0
+        for i in range(max_indices):
             size = self._probe_camera(i)
-            if size is not None:
-                w, h = size
-                found.append((i, f"{i}: Camera {i}  ({w}x{h})"))
+            if size is None:
+                misses += 1
+                if misses >= max_consecutive_misses:
+                    break
+                continue
+            misses = 0
+            w, h = size
+            found.append((i, f"{i}: Camera {i}  ({w}x{h})"))
+
         if not found:
             found = [(i, f"{i}: Camera {i}") for i in range(4)]
+        self.root.after(0, self._apply_scan_results, found)
 
+    def _apply_scan_results(self, found: list) -> None:
         self._cam_entries = {label: idx for idx, label in found}
         labels = [label for _, label in found]
         self._cam_combo["values"] = labels
@@ -587,6 +632,20 @@ class SplattApp:
         elif labels:
             self._cam_var.set(labels[0])
 
+    @staticmethod
+    def _probe_camera(idx: int):
+        """Return ``(width, height)`` for the camera at ``idx`` if openable."""
+        cap = cv2.VideoCapture(idx, _camera_backend())
+        try:
+            if not cap.isOpened():
+                return None
+            return (
+                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            )
+        finally:
+            cap.release()
+
     def _on_cam_selected(self, event=None):
         lbl = self._cam_var.get()
         if hasattr(self, "_cam_entries") and lbl in self._cam_entries:
@@ -594,38 +653,71 @@ class SplattApp:
             save_config(self.cfg)
             if self._running:
                 self._stop_camera()
-                self.root.after(400, self._start_camera)
+                # The next _start_camera call waits on _loop_done in
+                # its background open thread, so no manual delay is
+                # needed.
+                self._start_camera()
 
     def _start_camera(self):
+        """Stop if running; otherwise open the camera off the UI thread.
+
+        Opening a ``VideoCapture`` on macOS can stall the calling
+        thread for over a second while AVFoundation negotiates with
+        the device. Doing it on the Tk thread freezes the entire UI,
+        so we kick the open into a worker and finish setup on the main
+        thread once the capture handle is ready.
+        """
         if self._running:
             self._stop_camera()
             return
 
+        self._set_status("Opening camera…", GOLD)
+        self._btn_cam.configure(state="disabled")
         idx = self.cfg.get("camera_index", 0)
+        threading.Thread(target=self._open_camera_in_background,
+                         args=(idx,), daemon=True).start()
+
+    def _open_camera_in_background(self, idx) -> None:
+        # Wait for any previous camera loop to fully tear down its
+        # device handle before grabbing the next one. Without this,
+        # AVFoundation can hand us a half-released handle that hangs.
+        self._loop_done.wait(timeout=5.0)
         cap = self._open_capture(idx)
+        self.root.after(0, self._finish_camera_open, idx, cap)
+
+    def _finish_camera_open(self, idx, cap) -> None:
+        self._btn_cam.configure(state="normal")
         if cap is None:
+            self._set_status("READY", TEXT_SEC)
             messagebox.showerror(
                 "Camera Error",
                 f"Cannot open camera {idx}. Try another index.")
             return
 
-        self._cap = cap
         target_fps = int(self.cfg.get("video_fps", 30))
         self._configure_capture(cap, target_fps)
         actual_fps = cap.get(cv2.CAP_PROP_FPS)
         self._camera_fps = actual_fps if actual_fps > 0 else target_fps
 
+        self._cap = cap
         self._running = True
+        self._loop_done.clear()
         self._btn_cam.configure(text="■  Stop Camera")
         _set_variant(self._btn_cam, "danger")
         self._set_status("LIVE", ACCENT)
         self.audio.start()
-        threading.Thread(target=self._camera_loop, daemon=True).start()
+        threading.Thread(target=self._camera_loop,
+                         args=(cap,), daemon=True).start()
 
     @staticmethod
     def _open_capture(idx: int):
-        """Open the camera, preferring DirectShow on Windows, then default."""
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        """Open the camera using the OS-appropriate backend.
+
+        Falls back to ``CAP_ANY`` so an unusual driver setup still
+        works, but the platform-specific backend is tried first to
+        avoid OpenCV's slow probe of unsupported backends.
+        """
+        cap = cv2.VideoCapture(idx, _camera_backend())
         if cap.isOpened():
             return cap
         cap = cv2.VideoCapture(idx)
@@ -655,20 +747,31 @@ class SplattApp:
                     cv2.VideoWriter.fourcc("Y", "U", "Y", "2"))
 
     def _stop_camera(self):
+        """Signal the camera loop to exit; the loop releases the cap.
+
+        Releasing the capture from the UI thread while the loop thread
+        is mid-``cap.read()`` deadlocks AVFoundation on macOS. The loop
+        owns the device handle for its lifetime and tears it down on
+        exit.
+        """
         self._running = False
         self.audio.stop()
-        if self._cap:
-            self._cap.release()
-            self._cap = None
         self._btn_cam.configure(text="▶  Start Camera")
         _set_variant(self._btn_cam, "accent")
         self._set_status("STOPPED", TEXT_DIM)
 
 
 
-    def _camera_loop(self):
-        """
-        Optimised camera loop:
+    def _camera_loop(self, cap):
+        """Drive frame capture, ArUco detection and UI publishing.
+
+        The loop owns ``cap`` for its entire lifetime: the UI thread
+        signals exit via ``self._running``, and the loop releases the
+        device on the way out before setting ``self._loop_done``. This
+        keeps device teardown on the same thread that reads from it,
+        avoiding the macOS deadlock where ``cap.release()`` from the
+        UI thread blocks while the loop is mid-``cap.read()``.
+
         - BUFFERSIZE=1 means cap.read() always returns the freshest frame
         - Frame is downscaled to max 480p for ArUco detection regardless of
           capture resolution — this is the single biggest speed gain
@@ -681,41 +784,50 @@ class SplattApp:
         detect_w, detect_h = 640, 480
         fps = _FpsCounter()
 
-        while self._running:
-            if not self._cap or not self._cap.isOpened():
-                break
-            ret, frame = self._cap.read()
-            if not ret:
-                time.sleep(0.005)
-                continue
+        try:
+            while self._running:
+                if not cap.isOpened():
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.005)
+                    continue
 
-            if self.cfg.get("flip_image"):
-                frame = cv2.flip(frame, self.cfg.get("flip_mode", -1))
-            rotation = _ROTATION_FLAGS.get(self._camera_rotation)
-            if rotation is not None:
-                frame = cv2.rotate(frame, rotation)
+                if self.cfg.get("flip_image"):
+                    frame = cv2.flip(frame, self.cfg.get("flip_mode", -1))
+                rotation = _ROTATION_FLAGS.get(self._camera_rotation)
+                if rotation is not None:
+                    frame = cv2.rotate(frame, rotation)
 
-            small = self._downscale_for_detection(frame, detect_w, detect_h)
-            if self._focus_active:
-                self._sharpness = self._measure_sharpness(small)
+                small = self._downscale_for_detection(frame, detect_w, detect_h)
+                if self._focus_active:
+                    self._sharpness = self._measure_sharpness(small)
 
-            result = self.tracker.process_frame(small)
-            self._tracking_quality = result.quality
-            self._current_markers_found = result.markers_found
+                result = self.tracker.process_frame(small)
+                self._tracking_quality = result.quality
+                self._current_markers_found = result.markers_found
 
-            if result.aim_mm is not None and not self._paused:
-                self._consume_aim(result)
+                if result.aim_mm is not None and not self._paused:
+                    self._consume_aim(result)
 
-            self._live_fps = fps.tick()
-            if self._focus_active:
-                self._update_sharpness_peak()
+                self._live_fps = fps.tick()
+                if self._focus_active:
+                    self._update_sharpness_peak()
 
-            ui_counter += 1
-            if not no_video and ui_counter >= ui_every:
-                self._publish_camera_frame(result.frame_display, self._live_fps)
-                ui_counter = 0
+                ui_counter += 1
+                if not no_video and ui_counter >= ui_every:
+                    self._publish_camera_frame(result.frame_display, self._live_fps)
+                    ui_counter = 0
 
-            self._drain_shot_queue()
+                self._drain_shot_queue()
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            if self._cap is cap:
+                self._cap = None
+            self._loop_done.set()
 
     def _downscale_for_detection(self, frame, max_w: int, max_h: int):
         """Resize ``frame`` so it fits within (max_w, max_h) for detection."""
@@ -768,6 +880,7 @@ class SplattApp:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (80, 220, 80), 1, cv2.LINE_AA)
         self._latest_cam_frame = disp
+        self._request_cam_refresh()
 
     def _drain_shot_queue(self) -> None:
         """Process any queued audio triggers against the current aim."""
@@ -918,20 +1031,39 @@ class SplattApp:
             _set_toggle(self._btn_zero, False, accent_color=GOLD),
             self._set_status("ZEROED", ACCENT)
         ))
-    def _update_loop(self):
-        """Drive periodic UI refreshes.
+    def _tick_periodic(self):
+        """Slow timer for non-camera UI updates.
 
-        Live previews (camera frame, audio meter) run at ~30 Hz while
-        the camera is active. Score widgets and the shot log are only
-        refreshed when something has actually changed, which avoids
-        rebuilding the Text widget and 12 stat labels every tick.
+        The target render carries live shot traces and the active aim
+        crosshair, so it has to repaint while the camera is running.
+        Score widgets and the audio meter only need a few Hz to look
+        live. Polling at 10 Hz instead of 30 Hz frees the Tk thread to
+        process native events (dropdown clicks, menus, focus) without
+        contention from the GIL-heavy camera worker.
         """
         self._update_target_display()
         self._refresh_score_widgets_if_dirty()
         if self._running:
-            self._update_cam_display()
             self._update_audio_meter()
-        self.root.after(33, self._update_loop)
+        self.root.after(100, self._tick_periodic)
+
+    def _request_cam_refresh(self):
+        """Coalesced request to repaint the camera preview.
+
+        Called from the camera worker thread after each published
+        frame. ``after_idle`` runs the repaint on the Tk thread when
+        it next has spare time, and the pending flag prevents queuing
+        multiple repaints if frames arrive faster than Tk can draw.
+        """
+        if self._cam_refresh_pending or not self._running:
+            return
+        self._cam_refresh_pending = True
+        self.root.after_idle(self._do_cam_refresh)
+
+    def _do_cam_refresh(self):
+        self._cam_refresh_pending = False
+        if self._running:
+            self._update_cam_display()
 
     def _refresh_score_widgets_if_dirty(self):
         """Only repaint the score panel when its inputs have changed."""
@@ -1536,7 +1668,7 @@ class SplattApp:
         if cam_changed and self._running:
             self._set_status("Restarting camera with new settings…", GOLD)
             self._stop_camera()
-            self.root.after(600, self._start_camera)
+            self._start_camera()
 
     def _apply_session_cfg(self):
         """Push config values into the live session object."""
@@ -1856,8 +1988,9 @@ class SplattApp:
     def _on_close(self):
         self._running = False
         self.audio.stop()
-        if self._cap:
-            self._cap.release()
+        # Let the camera loop release the capture itself; releasing
+        # from the UI thread can deadlock on macOS.
+        self._loop_done.wait(timeout=2.0)
         # Close live writer first
         self.session.end_series()
         # Save full JSON archive
@@ -3200,22 +3333,21 @@ class SettingsDialog(tk.Toplevel):
             idx = 0
         self._cam_caps_lbl.config(text="Probing…")
         self.update()
-        import cv2 as _cv2
-        cap = _cv2.VideoCapture(idx, _cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(idx, _camera_backend())
         if not cap.isOpened():
-            cap = _cv2.VideoCapture(idx)
+            cap = cv2.VideoCapture(idx)
         if not cap.isOpened():
             self._cam_caps_lbl.config(text="Not found")
             return
         results = []
         for (w, h) in [(480,360),(640,480),(1280,720),(1920,1080)]:
-            cap.set(_cv2.CAP_PROP_FRAME_WIDTH,  w)
-            cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, h)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
             for fps_try in (60, 30):
-                cap.set(_cv2.CAP_PROP_FPS, fps_try)
-                aw = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
-                ah = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
-                af = cap.get(_cv2.CAP_PROP_FPS)
+                cap.set(cv2.CAP_PROP_FPS, fps_try)
+                aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                af = cap.get(cv2.CAP_PROP_FPS)
                 if aw == w and ah == h:
                     results.append(f"{w}×{h}@{af:.0f}")
                     break
