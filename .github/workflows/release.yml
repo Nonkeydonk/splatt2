@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create a GitHub Release and attach the built zips"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Tag for the release when publish_release is true (e.g. v1.2.0-rc1)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: splatt2-linux-x64
+          - os: macos-26
+            artifact: splatt2-macos-arm64
+          - os: macos-26-intel
+            artifact: splatt2-macos-x64
+          - os: windows-latest
+            artifact: splatt2-windows-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install Linux runtime deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libglib2.0-0 \
+            libportaudio2 \
+            python3-tk
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Build with PyInstaller
+        run: python build/build.py --clean
+
+      - name: Package artifact (zip)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cd dist
+          for d in splatt2-*/; do
+            d="${d%/}"
+            python -c "import shutil; shutil.make_archive('${d}', 'zip', '.', '${d}')"
+          done
+          ls -la
+
+      - name: Package artifact (zip, macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd dist
+          for d in splatt2-*/; do
+            d="${d%/}"
+            ditto -c -k --sequesterRsrc --keepParent "${d}" "${d}.zip"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate manual-dispatch inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ -z "${{ inputs.release_tag }}" ]; then
+            echo "::error::publish_release was ticked but release_tag is empty"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: >-
+            ${{ github.event_name == 'workflow_dispatch'
+                && inputs.release_tag
+                || github.ref_name }}
+          files: artifacts/**/*.zip
+          generate_release_notes: true
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}

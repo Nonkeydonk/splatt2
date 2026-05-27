@@ -23,3 +23,8 @@ desktop.ini
 
 # Generated images (from marker sheet dialog)
 aruco_sheet*.png
+
+# Build artifacts
+dist/
+build/_pyinstaller_work/
+build/icons/

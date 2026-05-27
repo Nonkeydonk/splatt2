@@ -1,56 +1,107 @@
-"""
-core/tracker.py
-ArUco marker tracking — computes where the camera is aimed relative to the
-target centre, expressed in millimetres on the target face.
+"""ArUco-based aim tracking and shot scoring.
 
-Layout expected on the printed A4 sheet:
-    Marker IDs:
-        0 ── top-left
-        1 ── top-right
-        2 ── bottom-right
-        3 ── bottom-left
+A printed sheet carries four (or six, or eight) ArUco markers at known
+positions. Each frame we:
 
-The four markers define the corners of a known rectangle (the "board").
-We use a homography from detected marker corners → known board coordinates
-to map the image centre (i.e. where the camera is pointing) into real-world
-mm coordinates relative to the target centre.
+1. Detect the markers in the camera image.
+2. Solve a homography from image pixels to board millimetres.
+3. Map the image centre - i.e. where the camera is pointing - through
+   that homography to get the aim point relative to the target centre.
+
+If markers are briefly lost, the most recent homography is reused for a
+short window so the aim point does not jitter to the centre on every
+dropped frame.
 """
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
 
 
-# ── Data classes ─────────────────────────────────────────────────────────────
+# Marker IDs 0-3 form the corners; 4-5 add the left/right edge midpoints
+# for 6-marker layouts; 6-7 add top/bottom for 8-marker layouts.
+_MARKER_LAYOUTS = {
+    4: [0, 1, 2, 3],
+    6: [0, 1, 2, 3, 4, 5],
+    8: [0, 1, 2, 3, 4, 5, 6, 7],
+}
+
 
 @dataclass
 class TrackFrame:
-    """Result of processing one video frame."""
-    aim_mm: Optional[Tuple[float, float]] = None   # (x, y) mm from target centre
-    aim_px: Optional[Tuple[int, int]] = None        # pixel location of aim on DISPLAY image
+    """Tracking output for one camera frame."""
+    aim_mm: Optional[Tuple[float, float]] = None
+    aim_px: Optional[Tuple[int, int]] = None
     markers_found: int = 0
-    frame_display: Optional[np.ndarray] = None      # annotated frame for display
+    frame_display: Optional[np.ndarray] = None
     homography: Optional[np.ndarray] = None
-    quality: float = 0.0                            # 0-1 tracking quality
+    quality: float = 0.0
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-MARKER_IDS = [0, 1, 2, 3]   # TL, TR, BR, BL
+def _build_board_corners(
+    board_w: float, board_h: float, marker: float, margin: float,
+) -> dict:
+    """Return the board-space (mm) corners for every supported marker ID."""
+    m, mg = marker, margin
+    bw, bh = board_w, board_h
+    return {
+        # Corners (TL, TR, BR, BL).
+        0: np.array([[mg, mg], [mg + m, mg], [mg + m, mg + m], [mg, mg + m]],
+                    dtype=np.float32),
+        1: np.array([[bw - mg - m, mg], [bw - mg, mg],
+                     [bw - mg, mg + m], [bw - mg - m, mg + m]],
+                    dtype=np.float32),
+        2: np.array([[bw - mg - m, bh - mg - m], [bw - mg, bh - mg - m],
+                     [bw - mg, bh - mg], [bw - mg - m, bh - mg]],
+                    dtype=np.float32),
+        3: np.array([[mg, bh - mg - m], [mg + m, bh - mg - m],
+                     [mg + m, bh - mg], [mg, bh - mg]],
+                    dtype=np.float32),
+        # Left and right edge midpoints (6-marker layout).
+        4: np.array([[mg, bh / 2 - m / 2], [mg + m, bh / 2 - m / 2],
+                     [mg + m, bh / 2 + m / 2], [mg, bh / 2 + m / 2]],
+                    dtype=np.float32),
+        5: np.array([[bw - mg - m, bh / 2 - m / 2],
+                     [bw - mg, bh / 2 - m / 2],
+                     [bw - mg, bh / 2 + m / 2],
+                     [bw - mg - m, bh / 2 + m / 2]],
+                    dtype=np.float32),
+        # Top and bottom edge midpoints (8-marker layout).
+        6: np.array([[bw / 2 - m / 2, mg], [bw / 2 + m / 2, mg],
+                     [bw / 2 + m / 2, mg + m], [bw / 2 - m / 2, mg + m]],
+                    dtype=np.float32),
+        7: np.array([[bw / 2 - m / 2, bh - mg - m],
+                     [bw / 2 + m / 2, bh - mg - m],
+                     [bw / 2 + m / 2, bh - mg],
+                     [bw / 2 - m / 2, bh - mg]],
+                    dtype=np.float32),
+    }
 
 
 class ArucoTracker:
-    """
-    Tracks the aim point using four ArUco markers arranged around a target.
+    """Track the aim point against a printed multi-marker board.
 
-    Parameters
-    ----------
-    board_width_mm  : real-world width of the marker board (outer edges of markers), mm
-    board_height_mm : real-world height of the marker board, mm
-    marker_size_mm  : printed size of each individual marker, mm
-    aruco_dict_name : cv2.aruco dictionary constant name string
+    Args:
+        board_width_mm: Real-world width of the printed sheet (mm).
+        board_height_mm: Real-world height of the printed sheet (mm).
+        marker_size_mm: Size of each printed ArUco marker (mm).
+        aruco_dict_name: Name of the ``cv2.aruco`` dictionary, e.g.
+            ``'DICT_4X4_50'``.
+        margin_mm: Distance from sheet edge to marker corner (mm).
+        use_clahe: Apply CLAHE contrast enhancement before detection.
+        clahe_clip: CLAHE clip limit (higher is more aggressive).
+        marker_count: Number of markers on the sheet (``4``, ``6`` or ``8``).
+        brightness_target: Mean brightness target for software gain
+            normalisation, used before CLAHE.
     """
+
+    MAX_HOMOGRAPHY_AGE = 5
+    """Frames a stale homography may be reused after detection drops out."""
 
     def __init__(
         self,
@@ -68,113 +119,65 @@ class ArucoTracker:
         self.board_height_mm = board_height_mm
         self.marker_size_mm = marker_size_mm
         self.margin_mm = margin_mm
+        self.use_clahe = use_clahe
+        self.brightness_target = float(brightness_target)
 
-        # Build ArUco detector
         dict_id = getattr(cv2.aruco, aruco_dict_name, cv2.aruco.DICT_4X4_50)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
         self.detector_params = cv2.aruco.DetectorParameters()
-        self.detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.detector_params)
+        self.detector_params.cornerRefinementMethod = (
+            cv2.aruco.CORNER_REFINE_SUBPIX)
+        self.detector = cv2.aruco.ArucoDetector(
+            self.aruco_dict, self.detector_params)
 
-        # CLAHE — Contrast Limited Adaptive Histogram Equalisation.
-        # Dramatically improves marker detection under uneven indoor lighting
-        # with negligible performance cost (~2ms per frame at 480p).
-        self.use_clahe = use_clahe
-        self.brightness_target = float(brightness_target)
         self._clahe = cv2.createCLAHE(
             clipLimit=float(clahe_clip), tileGridSize=(8, 8))
 
-        # Known corners of each marker in board-space (mm, origin = board TL)
-        # Order within each marker: TL, TR, BR, BL
-        m = marker_size_mm
-        mg = margin_mm
-        bw = board_width_mm
-        bh = board_height_mm
+        all_corners = _build_board_corners(
+            board_width_mm, board_height_mm, marker_size_mm, margin_mm)
+        active = _MARKER_LAYOUTS.get(marker_count, _MARKER_LAYOUTS[4])
+        self._board_corners = {k: all_corners[k] for k in active}
 
-        # Board corners for each marker ID — extended for 4/6/8 marker layouts.
-        # IDs 0-3: corners (TL, TR, BR, BL)
-        # IDs 4-5: left and right edge midpoints (6-marker layout)
-        # IDs 6-7: top and bottom edge midpoints (8-marker layout)
-        self._board_corners = {
-            0: np.array([[mg,       mg      ], [mg+m,    mg      ], [mg+m,    mg+m   ], [mg,      mg+m   ]], dtype=np.float32),
-            1: np.array([[bw-mg-m,  mg      ], [bw-mg,   mg      ], [bw-mg,   mg+m   ], [bw-mg-m, mg+m   ]], dtype=np.float32),
-            2: np.array([[bw-mg-m,  bh-mg-m ], [bw-mg,   bh-mg-m], [bw-mg,   bh-mg  ], [bw-mg-m, bh-mg  ]], dtype=np.float32),
-            3: np.array([[mg,       bh-mg-m ], [mg+m,    bh-mg-m], [mg+m,    bh-mg  ], [mg,      bh-mg  ]], dtype=np.float32),
-            # 6-marker: left and right edge midpoints (matches printed sheet)
-            4: np.array([[mg,       bh/2-m/2], [mg+m,    bh/2-m/2], [mg+m,    bh/2+m/2], [mg,      bh/2+m/2]], dtype=np.float32),
-            5: np.array([[bw-mg-m,  bh/2-m/2], [bw-mg,   bh/2-m/2], [bw-mg,   bh/2+m/2], [bw-mg-m, bh/2+m/2]], dtype=np.float32),
-            # 8-marker: top and bottom edge midpoints (matches printed sheet)
-            6: np.array([[bw/2-m/2, mg      ], [bw/2+m/2, mg      ], [bw/2+m/2, mg+m   ], [bw/2-m/2, mg+m  ]], dtype=np.float32),
-            7: np.array([[bw/2-m/2, bh-mg-m ], [bw/2+m/2, bh-mg-m], [bw/2+m/2, bh-mg  ], [bw/2-m/2, bh-mg ]], dtype=np.float32),
-        }
-        # Restrict to the active marker count
-        active_ids = {4: [0,1,2,3], 6: [0,1,2,3,4,5], 8: [0,1,2,3,4,5,6,7]}
-        keep = active_ids.get(marker_count, [0,1,2,3])
-        self._board_corners = {k: v for k, v in self._board_corners.items() if k in keep}
-
-        # Target centre in board-space (mm) — exactly the centre of the board
-        self.target_centre_mm = np.array([bw / 2, bh / 2], dtype=np.float32)
+        self.target_centre_mm = np.array(
+            [board_width_mm / 2, board_height_mm / 2], dtype=np.float32)
 
         self._last_homography: Optional[np.ndarray] = None
         self._homography_age: int = 0
-        self.MAX_HOMOGRAPHY_AGE = 5   # frames we'll reuse a stale homography
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def _make_empty_result(self) -> "TrackFrame":
-        r = TrackFrame()
-        return r
 
     def process_frame(self, frame: np.ndarray) -> TrackFrame:
+        """Run detection on one BGR frame and return the resulting state."""
         result = TrackFrame()
         result.frame_display = frame.copy()
 
-        # Pre-process: greyscale → software gain normalisation → CLAHE
-        # Gain normalisation scales brightness to a fixed target regardless of
-        # ambient light changes (clouds, time of day). Operates entirely in
-        # Python — no driver cooperation needed.
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if self.use_clahe:
-            mean = float(np.mean(gray))
-            if mean > 1.0:
-                scale = self.brightness_target / mean
-                gray = np.clip(gray.astype(np.float32) * scale,
-                               0, 255).astype(np.uint8)
-            gray = self._clahe.apply(gray)
-        corners, ids, rejected = self.detector.detectMarkers(gray)
+        gray = self._preprocess(frame)
+        corners, ids, _ = self.detector.detectMarkers(gray)
 
         if ids is None or len(ids) == 0:
-            result.markers_found = 0
             self._homography_age += 1
             self._try_reuse_homography(result, frame)
             return result
 
-        # Flatten id array
         ids_flat = ids.flatten()
         result.markers_found = len(ids_flat)
-
-        # Draw detected markers
         cv2.aruco.drawDetectedMarkers(result.frame_display, corners, ids)
 
-        # Build point correspondences: image pixel → board mm
         img_pts: List[np.ndarray] = []
         brd_pts: List[np.ndarray] = []
-
         for i, mid in enumerate(ids_flat):
             if mid in self._board_corners:
-                img_pts.append(corners[i][0])          # shape (4,2)
+                img_pts.append(corners[i][0])
                 brd_pts.append(self._board_corners[mid])
 
-        if len(img_pts) < 1:
+        if not img_pts:
             self._homography_age += 1
             self._try_reuse_homography(result, frame)
             return result
 
-        img_pts_all = np.concatenate(img_pts, axis=0)   # (N*4, 2)
-        brd_pts_all = np.concatenate(brd_pts, axis=0)
-
-        H, mask = cv2.findHomography(img_pts_all, brd_pts_all, cv2.RANSAC, 5.0)
-
+        H, _ = cv2.findHomography(
+            np.concatenate(img_pts, axis=0),
+            np.concatenate(brd_pts, axis=0),
+            cv2.RANSAC, 5.0,
+        )
         if H is None:
             self._homography_age += 1
             self._try_reuse_homography(result, frame)
@@ -184,125 +187,127 @@ class ArucoTracker:
         self._homography_age = 0
         result.homography = H
         result.quality = min(1.0, len(img_pts) / len(self._board_corners))
-
         self._compute_aim(result, frame)
         return result
 
-    # ── Private helpers ───────────────────────────────────────────────────────
+    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
+        """Greyscale, software gain normalisation, then CLAHE."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if not self.use_clahe:
+            return gray
+        mean = float(np.mean(gray))
+        if mean > 1.0:
+            scale = self.brightness_target / mean
+            gray = np.clip(
+                gray.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        return self._clahe.apply(gray)
 
-    def _try_reuse_homography(self, result: TrackFrame, frame: np.ndarray):
-        if self._last_homography is not None and self._homography_age <= self.MAX_HOMOGRAPHY_AGE:
-            result.homography = self._last_homography
-            result.quality = max(0.1, 0.5 - self._homography_age * 0.1)
-            self._compute_aim(result, frame)
+    def _try_reuse_homography(
+        self, result: TrackFrame, frame: np.ndarray,
+    ) -> None:
+        if self._last_homography is None:
+            return
+        if self._homography_age > self.MAX_HOMOGRAPHY_AGE:
+            return
+        result.homography = self._last_homography
+        result.quality = max(0.1, 0.5 - self._homography_age * 0.1)
+        self._compute_aim(result, frame)
 
-    def _compute_aim(self, result: TrackFrame, frame: np.ndarray):
+    def _compute_aim(
+        self, result: TrackFrame, frame: np.ndarray,
+    ) -> None:
         H = result.homography
         if H is None:
             return
 
         h, w = frame.shape[:2]
         img_centre = np.array([[[w / 2, h / 2]]], dtype=np.float32)
-
-        # Map image centre → board coordinates (mm)
         board_pt = cv2.perspectiveTransform(img_centre, H)[0][0]
 
-        # Convert to mm offset from target centre
-        aim_mm = (
+        result.aim_mm = (
             float(board_pt[0] - self.target_centre_mm[0]),
             float(board_pt[1] - self.target_centre_mm[1]),
         )
-        result.aim_mm = aim_mm
-
-        # Also store pixel coordinates of aim (image centre)
         result.aim_px = (int(w / 2), int(h / 2))
 
-        # Draw crosshair on display frame
-        cx, cy = int(w / 2), int(h / 2)
-        color = (0, 255, 0) if result.quality > 0.5 else (0, 165, 255)
-        cv2.line(result.frame_display, (cx - 20, cy), (cx + 20, cy), color, 2)
-        cv2.line(result.frame_display, (cx, cy - 20), (cx, cy + 20), color, 2)
-        cv2.circle(result.frame_display, (cx, cy), 8, color, 1)
+        cx, cy = result.aim_px
+        colour = (0, 255, 0) if result.quality > 0.5 else (0, 165, 255)
+        cv2.line(result.frame_display,
+                 (cx - 20, cy), (cx + 20, cy), colour, 2)
+        cv2.line(result.frame_display,
+                 (cx, cy - 20), (cx, cy + 20), colour, 2)
+        cv2.circle(result.frame_display, (cx, cy), 8, colour, 1)
 
-        # Annotate aim coords
-        txt = f"Aim: ({aim_mm[0]:+.1f}, {aim_mm[1]:+.1f}) mm"
-        cv2.putText(result.frame_display, txt, (10, h - 10),
+        text = f"Aim: ({result.aim_mm[0]:+.1f}, {result.aim_mm[1]:+.1f}) mm"
+        cv2.putText(result.frame_display, text, (10, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
 
-# ── Scoring ────────────────────────────────────────────────────────────────────
+def _nearest_mark(
+    aim_mm: Tuple[float, float], mark_offsets: list,
+) -> Tuple[int, Tuple[float, float]]:
+    """Return ``(index, local_aim)`` for the nearest mark."""
+    best_idx = 0
+    best_local = aim_mm
+    best_dist = float("inf")
+    for idx, (mx, my) in enumerate(mark_offsets):
+        dx = aim_mm[0] - mx
+        dy = aim_mm[1] - my
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+            best_local = (dx, dy)
+    return best_idx, best_local
+
 
 def score_shot(
-    aim_mm: tuple,
+    aim_mm: Tuple[float, float],
     scoring_radius_mm: float,
     decimal: bool = False,
-    mark_offsets: list = None,
-) -> tuple:
+    mark_offsets: Optional[list] = None,
+) -> Tuple[float, int, int]:
+    """Score a shot purely from geometry.
+
+    Args:
+        aim_mm: Aim position ``(x, y)`` in mm relative to sheet centre.
+        scoring_radius_mm: ``card_radius + calibre_radius``.
+        decimal: ``True`` for 99 ISSF decimal bands; ``False`` for 10
+            integer bands.
+        mark_offsets: Optional list of mark centres for multi-mark
+            targets. When provided, the shot is assigned to the nearest
+            mark and scored relative to that mark's centre.
+
+    Returns:
+        ``(score, band_index, mark_index)``. A miss returns
+        ``(0.0, -1, mark_index)``. ``mark_index`` is always ``0`` for
+        single-mark targets.
     """
-    Score a shot purely from geometry.
-
-    aim_mm            : (x, y) in mm from sheet centre.
-    scoring_radius_mm : R = card_radius + calibre_radius.
-    decimal           : 99 bands (10.9->1.0) if True; 10 bands (10->1) if False.
-    mark_offsets      : list of (x_mm, y_mm) mark centres for multi-mark targets.
-                        If None, scores relative to (0,0) — single-mark behaviour
-                        unchanged. If multiple marks, assigns shot to nearest mark
-                        (Option C) and scores relative to that mark centre.
-
-    Returns (score, band_index, mark_index).
-    mark_index is always 0 for single-mark targets.
-    score=0.0, band=-1, mark_index=0 for a complete miss.
-    """
-    import math as _math
-
-    # Multi-mark: find nearest mark centre
     if mark_offsets and len(mark_offsets) > 1:
-        best_dist  = float("inf")
-        best_mark  = 0
-        best_local = aim_mm
-        for idx, (mx, my) in enumerate(mark_offsets):
-            dx = aim_mm[0] - mx
-            dy = aim_mm[1] - my
-            d  = _math.sqrt(dx*dx + dy*dy)
-            if d < best_dist:
-                best_dist  = d
-                best_mark  = idx
-                best_local = (dx, dy)
-        aim_local = best_local
-        mark_idx  = best_mark
+        mark_idx, aim_local = _nearest_mark(aim_mm, mark_offsets)
     else:
-        aim_local = aim_mm
-        mark_idx  = 0
+        mark_idx, aim_local = 0, aim_mm
 
-    aim_r = _math.sqrt(aim_local[0]**2 + aim_local[1]**2)
-
+    aim_r = math.sqrt(aim_local[0] ** 2 + aim_local[1] ** 2)
     if aim_r > scoring_radius_mm:
         return 0.0, -1, mark_idx
 
     if decimal:
         n_bands = 99
-        step    = 9.9 / 98
-        band_w  = scoring_radius_mm / n_bands
-        band_n  = min(int(aim_r / band_w), n_bands - 1)
-        score   = round(10.9 - band_n * step, 1)
-        return score, band_n, mark_idx
-    else:
-        n_bands = 10
-        band_w  = scoring_radius_mm / n_bands
-        band_n  = min(int(aim_r / band_w), n_bands - 1)
-        score   = float(10 - band_n)
-        return score, band_n, mark_idx
+        step = 9.9 / 98
+        band = min(int(aim_r / (scoring_radius_mm / n_bands)), n_bands - 1)
+        return round(10.9 - band * step, 1), band, mark_idx
 
-def aim_to_display(aim_mm, target_cfg, display_size_px):
-    """
-    Convert aim_mm (x,y) offset from target centre into pixel coordinates
-    on the target display canvas.
+    n_bands = 10
+    band = min(int(aim_r / (scoring_radius_mm / n_bands)), n_bands - 1)
+    return float(10 - band), band, mark_idx
 
-    display_size_px: (width, height) of the target display area
-    """
+
+def aim_to_display(
+    aim_mm: Tuple[float, float], target_cfg: dict, display_size_px: tuple,
+) -> Tuple[int, int]:
+    """Convert an aim offset (mm) to canvas pixels for the target view."""
     dw, dh = display_size_px
-    scale = min(dw, dh) / target_cfg["diameter_mm"]  # px per mm
+    scale = min(dw, dh) / target_cfg["diameter_mm"]
     cx, cy = dw / 2, dh / 2
-    px = int(cx + aim_mm[0] * scale)
-    py = int(cy + aim_mm[1] * scale)
-    return px, py
+    return int(cx + aim_mm[0] * scale), int(cy + aim_mm[1] * scale)
