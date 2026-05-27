@@ -39,6 +39,10 @@ class TrackFrame:
     aim_px: Optional[Tuple[int, int]] = None
     markers_found: int = 0
     frame_display: Optional[np.ndarray] = None
+    # Post-preprocessing diagnostic frame (BGR) showing what the ArUco
+    # detector receives, with marker boxes and aim crosshair drawn on
+    # top so it is directly comparable to ``frame_display``.
+    processed: Optional[np.ndarray] = None
     homography: Optional[np.ndarray] = None
     quality: float = 0.0
 
@@ -164,6 +168,10 @@ class ArucoTracker:
         result.frame_display = frame.copy()
 
         gray = self._preprocess(frame)
+        # ``processed`` mirrors the detector's input as a 3-channel
+        # image so the same overlays can be drawn on it for the UI's
+        # tracker-view diagnostic.
+        result.processed = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         corners, ids, _ = self.detector.detectMarkers(gray)
 
         if ids is None or len(ids) == 0:
@@ -174,6 +182,7 @@ class ArucoTracker:
         ids_flat = ids.flatten()
         result.markers_found = len(ids_flat)
         cv2.aruco.drawDetectedMarkers(result.frame_display, corners, ids)
+        cv2.aruco.drawDetectedMarkers(result.processed, corners, ids)
 
         img_pts: List[np.ndarray] = []
         brd_pts: List[np.ndarray] = []
@@ -258,15 +267,16 @@ class ArucoTracker:
 
         cx, cy = result.aim_px
         colour = (0, 255, 0) if result.quality > 0.5 else (0, 165, 255)
-        cv2.line(result.frame_display,
-                 (cx - 20, cy), (cx + 20, cy), colour, 2)
-        cv2.line(result.frame_display,
-                 (cx, cy - 20), (cx, cy + 20), colour, 2)
-        cv2.circle(result.frame_display, (cx, cy), 8, colour, 1)
-
         text = f"Aim: ({result.aim_mm[0]:+.1f}, {result.aim_mm[1]:+.1f}) mm"
-        cv2.putText(result.frame_display, text, (10, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        for canvas in (result.frame_display, result.processed):
+            if canvas is None:
+                continue
+            cv2.line(canvas, (cx - 20, cy), (cx + 20, cy), colour, 2)
+            cv2.line(canvas, (cx, cy - 20), (cx, cy + 20), colour, 2)
+            cv2.circle(canvas, (cx, cy), 8, colour, 1)
+            cv2.putText(canvas, text, (10, h - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
 
 def _nearest_mark(

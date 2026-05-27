@@ -172,6 +172,10 @@ class SplattApp:
         # frame before detection so distant marker sheets get more
         # pixels per marker. 1.0 means no crop.
         self._cam_zoom = float(self.cfg.get("camera_zoom", 1.0))
+        # Diagnostic mode: when on, the camera preview shows the
+        # greyscale frame the ArUco detector actually sees (after
+        # gain, CLAHE and sharpen) instead of the raw BGR feed.
+        self._show_processed = False
         self._live_fps = 0.0
         self._sharpness = 0.0
         self._sharpness_peak = 0.0
@@ -299,6 +303,10 @@ class SplattApp:
                                      self._focus_active,
                                      self._toggle_focus_assist)
         self._btn_focus.pack(side="left")
+        self._btn_processed = _mk_toggle(
+            ff_btn, "◧ Tracker view",
+            self._show_processed, self._toggle_processed_view)
+        self._btn_processed.pack(side="left", padx=(4, 0))
 
         self._focus_frame = tk.Frame(parent, bg=BG_PANEL)
         # Not packed yet — shown only when active
@@ -839,7 +847,11 @@ class SplattApp:
 
                 ui_counter += 1
                 if not no_video and ui_counter >= ui_every:
-                    self._publish_camera_frame(result.frame_display, self._live_fps)
+                    if self._show_processed and result.processed is not None:
+                        preview = result.processed
+                    else:
+                        preview = result.frame_display
+                    self._publish_camera_frame(preview, self._live_fps)
                     ui_counter = 0
 
                 self._drain_shot_queue()
@@ -1376,6 +1388,16 @@ class SplattApp:
             self._focus_lbl.config(text="—", fg=TEXT_DIM)
             self._btn_focus.config(text="◎ Focus assist: OFF")
         _set_toggle(self._btn_focus, self._focus_active)
+
+    def _toggle_processed_view(self):
+        """Toggle showing the post-processed (tracker view) frame.
+
+        Helpful for tuning CLAHE, sharpen and zoom: the preview shows
+        exactly what the ArUco detector receives, so you can see if a
+        marker is washed out, soft, or split by uneven lighting.
+        """
+        self._show_processed = not self._show_processed
+        _set_toggle(self._btn_processed, self._show_processed)
 
     def _on_zoom_change(self, val=None):
         """Zoom slider changed — rebuild renderer at new scale."""
