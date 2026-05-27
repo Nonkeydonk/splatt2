@@ -1,53 +1,115 @@
+"""User configuration and target catalogue.
+
+Targets are loaded from CSV files in two locations: a read-only seed
+directory bundled with the app, and a user-writable directory under the
+app data folder. User files override seeds with the same key, so a
+shooter can tweak a built-in target without losing the original.
+
+The runtime config is a plain JSON dict persisted to the user data dir.
 """
-Splatt2 Configuration
-All user-configurable settings and target definitions.
-"""
+
+from __future__ import annotations
 
 import json
 import os
+import shutil
+from typing import Iterable, Optional, Tuple
+
+from core.paths import config_path, resource_path, user_targets_dir
 
 VERSION = "1.1.0"
 
-def _config_path() -> str:
-    """Config file lives in the project root (next to main.py)."""
-    import os
-    base = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(base)  # up from core/ to project root
-    return os.path.join(base, "splatt2_config.json")
-
-CONFIG_FILE = _config_path()
-
-# ── Target definitions — loaded from targets/ folder ────────────────────────
-# Each .csv in the targets/ folder defines one target.
-# Format: header rows (key=value), then a blank line,
-#         then "score,ring_diameter_mm" header, then data rows.
-# Ring diameters are in mm (not radii). Innermost ring first.
-
-def _targets_dir() -> str:
-    """Return the absolute path to the targets/ folder."""
-    import os
-    base = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(base)  # up from core/ to project root
-    return os.path.join(base, "targets")
+CONFIG_FILE = str(config_path())
 
 
-def _load_target_csv(path: str) -> dict:
-    """
-    Parse a single target CSV file.
+def _migrate_legacy_config() -> None:
+    """Copy any pre-1.2 config beside ``main.py`` into the user data dir."""
+    if os.path.exists(CONFIG_FILE):
+        return
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    legacy = os.path.join(project_root, "splatt2_config.json")
+    if not os.path.isfile(legacy):
+        return
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        shutil.copy2(legacy, CONFIG_FILE)
+        print(f"[Config] Migrated legacy config -> {CONFIG_FILE}")
+    except OSError as e:
+        print(f"[Config] Could not migrate legacy config: {e}")
 
-    Header rows (key=value), then a blank line, then:
-        score,ring_diameter_mm
-        10,0.5
-        9,5.5
-        ...
 
-    ring_diameter_mm values are the VISUAL ring boundaries (mm diameter).
-    Scoring geometry is computed at runtime from card_diameter_mm + calibre.
-    """
-    meta = {}
-    scores    = []
-    diameters = []
-    in_data   = False
+_migrate_legacy_config()
+
+
+# Target CSV layout
+# -----------------
+# Header rows in ``key=value`` form, then a separator header, then data
+# rows. Two header forms are accepted::
+#
+#     score,ring_diameter_mm
+#     score_integer,score_decimal,ring_diameter_mm
+#
+# Ring diameters are visual only; scoring geometry is computed at runtime
+# from ``card_diameter_mm`` and the configured pellet calibre.
+
+_DATA_HEADERS = (
+    "score,ring_diameter_mm",
+    "score_integer,score_decimal,ring_diameter_mm",
+)
+
+
+def bundled_targets_dir() -> str:
+    """Read-only directory of bundled target CSVs."""
+    return str(resource_path("targets"))
+
+
+def writable_targets_dir() -> str:
+    """User-writable directory of target CSVs."""
+    return str(user_targets_dir())
+
+
+# Backwards-compatible aliases used by the UI module.
+_targets_dir = bundled_targets_dir
+_user_targets_dir = writable_targets_dir
+
+
+def _parse_csv_row(parts: list) -> Optional[Tuple[float, float]]:
+    """Return ``(score, diameter_mm)`` for a CSV data row, or ``None``."""
+    if len(parts) == 2:
+        return float(parts[0]), float(parts[1])
+    if len(parts) == 3:
+        # Legacy three-column format: score_integer, score_decimal, diameter.
+        return float(parts[0]), float(parts[2])
+    return None
+
+
+def _quincunx_offsets(spacing_mm: float) -> list:
+    """Five mark centres in a quincunx pattern at the given spacing."""
+    h = spacing_mm / 2
+    return [
+        (-h, -h), (+h, -h),
+        (0.0, 0.0),
+        (-h, +h), (+h, +h),
+    ]
+
+
+def _resolve_mark_offsets(meta: dict) -> Optional[list]:
+    """Build mark centres for a multi-mark target, or ``None``."""
+    mark_count = int(meta.get("mark_count", 1))
+    if mark_count <= 1:
+        return None
+    spacing = float(meta.get("mark_spacing_mm", 75.0))
+    if mark_count == 5:
+        return _quincunx_offsets(spacing)
+    return None
+
+
+def load_target_csv(path: str) -> Optional[dict]:
+    """Parse a single target CSV into a target dict, or ``None`` on error."""
+    meta: dict = {}
+    scores: list = []
+    diameters: list = []
+    in_data = False
 
     try:
         with open(path, newline="", encoding="utf-8") as f:
@@ -55,21 +117,14 @@ def _load_target_csv(path: str) -> dict:
                 line = raw.strip()
                 if not line or line.startswith("#"):
                     continue
-                low = line.lower()
-                # Accept both old and new header names
-                if low in ("score,ring_diameter_mm",
-                           "score_integer,score_decimal,ring_diameter_mm"):
+                if line.lower() in _DATA_HEADERS:
                     in_data = True
                     continue
                 if in_data:
-                    parts = [p.strip() for p in line.split(",")]
-                    # Old two-column format: take only first and last columns
-                    if len(parts) == 3:
-                        scores.append(float(parts[0]))
-                        diameters.append(float(parts[2]))
-                    elif len(parts) == 2:
-                        scores.append(float(parts[0]))
-                        diameters.append(float(parts[1]))
+                    row = _parse_csv_row([p.strip() for p in line.split(",")])
+                    if row is not None:
+                        scores.append(row[0])
+                        diameters.append(row[1])
                 else:
                     parts = line.split(",", 1)
                     if len(parts) == 2:
@@ -81,170 +136,170 @@ def _load_target_csv(path: str) -> dict:
     if not scores or "key" not in meta or "name" not in meta:
         return None
 
-    # Visual ring radii (for rendering only — NOT used for scoring)
-    rings_mm    = [d / 2.0 for d in diameters]
-    outer_dia   = float(meta.get("card_diameter_mm", diameters[-1]))
-    aiming_dia  = float(meta.get("aiming_mark_dia_mm", diameters[0]))
+    rings_mm = [d / 2.0 for d in diameters]
+    outer_dia = float(meta.get("card_diameter_mm", diameters[-1]))
+    aiming_dia = float(meta.get("aiming_mark_dia_mm", diameters[0]))
     unique_dias = list(dict.fromkeys(diameters))
-
     ring_labels = [str(int(s)) if s == int(s) else str(s) for s in scores]
-
-    # ── Multi-mark support ───────────────────────────────────────────────────
-    # mark_count and mark_spacing_mm are optional — single-mark targets omit them.
-    # mark_offsets: list of (x_mm, y_mm) centres relative to sheet centre.
-    # For a 5-mark quincunx at spacing s:
-    #   (-s,-s)  (+s,-s)     (Y+ = down, matching OpenCV)
-    #      (0, 0)
-    #   (-s,+s)  (+s,+s)
     mark_count = int(meta.get("mark_count", 1))
-    mark_offsets = None   # None = single mark at (0,0)
-    if mark_count > 1:
-        s = float(meta.get("mark_spacing_mm", 75.0))
-        if mark_count == 5:
-            h = s / 2      # half the square side = offset on each axis
-            mark_offsets = [
-                (-h, -h),   # top-left
-                (+h, -h),   # top-right
-                ( 0,  0),   # centre
-                (-h, +h),   # bottom-left
-                (+h, +h),   # bottom-right
-            ]
-        # Future: other mark_count values can be added here
+
+    # Optional explicit bull diameter for the renderer; targets that
+    # don't set this fall back to the historical "outer 4 rings dark,
+    # inner 6 rings light" rule applied in TargetRenderer.
+    bull_dia = meta.get("bull_dia_mm")
+    bull_dia = float(bull_dia) if bull_dia is not None else None
 
     return {
-        "name":               meta["name"],
-        "key":                meta["key"],
-        "diameter_mm":        outer_dia,
-        "rings_mm":           rings_mm,
-        "ring_scores":        scores,
-        "gauging":            meta.get("gauging", "outward"),
-        "calibre_mm":         float(meta.get("calibre_mm", 4.5)),
-        "reference_dist_m":   float(meta.get("reference_dist_m", 10.0)),
+        "name": meta["name"],
+        "key": meta["key"],
+        "diameter_mm": outer_dia,
+        "rings_mm": rings_mm,
+        "ring_scores": scores,
+        "gauging": meta.get("gauging", "outward"),
+        "calibre_mm": float(meta.get("calibre_mm", 4.5)),
+        "reference_dist_m": float(meta.get("reference_dist_m", 10.0)),
         "aiming_mark_dia_mm": aiming_dia,
-        "outer_ring_dia_mm":  outer_dia,
-        "rings_dia_mm":       unique_dias,
-        "ring_labels":        ring_labels,
-        "a4_target_width_mm": float(meta.get("a4_target_width_mm",
-                                             min(outer_dia * 1.1, 170))),
-        "mark_count":         mark_count,
-        "mark_offsets":       mark_offsets,   # None for single-mark targets
-        "mark_spacing_mm":    float(meta.get("mark_spacing_mm", 0)),
+        "bull_dia_mm": bull_dia,
+        "outer_ring_dia_mm": outer_dia,
+        "rings_dia_mm": unique_dias,
+        "ring_labels": ring_labels,
+        "a4_target_width_mm": float(
+            meta.get("a4_target_width_mm", min(outer_dia * 1.1, 170))),
+        "mark_count": mark_count,
+        "mark_offsets": _resolve_mark_offsets(meta),
+        "mark_spacing_mm": float(meta.get("mark_spacing_mm", 0)),
     }
 
-def _load_all_targets() -> dict:
-    """Load all .csv files from the targets/ folder. Returns {key: target_dict}."""
-    tdir = _targets_dir()
-    targets = {}
-    if not os.path.isdir(tdir):
-        print(f"[Targets] Folder not found: {tdir}")
-        return targets
-    for fname in sorted(os.listdir(tdir)):
-        if not fname.lower().endswith(".csv"):
+
+# Backwards-compatible alias.
+_load_target_csv = load_target_csv
+
+
+def _iter_target_files(directories: Iterable[str]):
+    """Yield ``(directory, filename)`` for every CSV in the given dirs."""
+    for tdir in directories:
+        if not os.path.isdir(tdir):
             continue
-        path = os.path.join(tdir, fname)
-        t = _load_target_csv(path)
-        if t:
-            targets[t["key"]] = t
+        for fname in sorted(os.listdir(tdir)):
+            if fname.lower().endswith(".csv"):
+                yield tdir, fname
+
+
+def load_all_targets() -> dict:
+    """Merge target CSVs from the bundle and the user dir into a dict."""
+    targets: dict = {}
+    for tdir, fname in _iter_target_files(
+            (bundled_targets_dir(), writable_targets_dir())):
+        target = load_target_csv(os.path.join(tdir, fname))
+        if target:
+            targets[target["key"]] = target
     return targets
 
 
-TARGETS = _load_all_targets()
+_load_all_targets = load_all_targets
+
+TARGETS = load_all_targets()
 
 
-# ── Default runtime config ──────────────────────────────────────────────────
 DEFAULT_CONFIG = {
-    # ── Target & scoring ─────────────────────────────────────────────────────
-    "target_key":              "10m_air_rifle",
-    "real_range_m":            10.0,         # shooting distance (m)
-    "shot_circle_calibre_mm":  4.5,          # displayed shot hole diameter (mm)
-    "scoring_calibre_mm":      4.5,          # pellet diameter for scoring geometry (.177=4.5 .22=5.6)
-    "decimal_scoring":         False,        # ISSF decimal scoring mode
-    "ignore_misses":           False,        # discard shots scoring 0
+    # Target & scoring
+    "target_key": "10m_air_rifle",
+    "real_range_m": 10.0,
+    "shot_circle_calibre_mm": 4.5,
+    "scoring_calibre_mm": 4.5,
+    "decimal_scoring": False,
+    "ignore_misses": False,
 
-    # ── Camera ───────────────────────────────────────────────────────────────
-    "camera_index":    0,
-    "video_width":     640,
-    "video_height":    480,
-    "video_fps":       30,
-    "camera_rotation": 0,       # 0 / 90 / 180 / 270 degrees
-    "flip_image":      False,
-    "flip_mode":       -1,
-    "no_video_mode":   False,   # skip camera preview (faster on slow machines)
-    "use_clahe":       True,    # adaptive contrast enhancement for ArUco detection
-    "clahe_clip":      4.0,     # CLAHE clip limit (2=mild, 4=moderate, 8=aggressive)
-    "brightness_target": 128.0, # software gain target brightness (0-255, 128=mid)
-    "spike_velocity_mm":  25.0, # min mm/frame for spike candidate
-    "spike_reversal":     0.7,  # min reversal ratio to confirm spike (0-1)
+    # Camera
+    "camera_index": 0,
+    "video_width": 640,
+    "video_height": 480,
+    "video_fps": 30,
+    "camera_rotation": 0,
+    "flip_image": False,
+    "flip_mode": -1,
+    "no_video_mode": False,
+    "use_clahe": True,
+    "clahe_clip": 4.0,
+    "brightness_target": 128.0,
+    "spike_velocity_mm": 25.0,
+    "spike_reversal": 0.7,
 
-    # ── ArUco tracking ───────────────────────────────────────────────────────
-    "aruco_dict":       "DICT_4X4_50",
-    "aruco_marker_count": 4,        # number of ArUco markers: 4, 6, or 8
-    "camera_pixel_format": "Auto",  # Auto / MJPEG / YUY2
-    "aruco_marker_mm":  40.0,   # printed size of each ArUco marker (mm)
-    "aruco_margin_mm":  8.0,    # margin from sheet edge to marker corner (mm)
+    # ArUco tracking
+    "aruco_dict": "DICT_4X4_50",
+    "aruco_marker_count": 4,
+    "camera_pixel_format": "Auto",
+    "aruco_marker_mm": 40.0,
+    "aruco_margin_mm": 8.0,
 
-    # ── Smoothing ────────────────────────────────────────────────────────────
-    "smooth_mode":   "ema",     # "none" / "ema" / "savgol"
-    "smooth_alpha":  0.35,      # EMA alpha (0.05=heavy smooth, 0.8=light)
-    "smooth_window": 11,        # Savitzky-Golay window size (odd number)
-    "smooth_poly":   2,         # Savitzky-Golay polynomial degree
+    # Smoothing
+    "smooth_mode": "ema",
+    "smooth_alpha": 0.35,
+    "smooth_window": 11,
+    "smooth_poly": 2,
 
-    # ── Audio detection ──────────────────────────────────────────────────────
-    "audio_device_index":       None,
-    "audio_sample_rate":        44100,
-    "audio_trigger_threshold":  0.4,
-    "audio_transient_ratio":    6.0,
-    "audio_trigger_cooldown_ms":800,
-    "post_shot_cooldown_s":     2.0,   # ignore audio N seconds after a shot
+    # Audio detection
+    "audio_device_index": None,
+    "audio_sample_rate": 44100,
+    "audio_trigger_threshold": 0.4,
+    "audio_transient_ratio": 6.0,
+    "audio_trigger_cooldown_ms": 800,
+    "post_shot_cooldown_s": 2.0,
 
-    # ── Trace colours (hex, BGR-converted at render time) ────────────────────
-    "colour_trace_approach": "#3c3c3c",  # approach zone: dark grey
-    "colour_trace_hold":     "#28be50",  # early hold: green
-    "colour_trace_preshot":  "#f0d000",  # pre-shot window: yellow
-    "colour_trace_final":    "#e03020",  # final window: red
-    "colour_shot_fill":      "#5050ff",  # shot hole fill
-    "colour_acp":            "#ffc800",  # ACP marker
-    "colour_crosshair":      "#00dc64",  # live crosshair
-    "colour_mpi":            "#50b4ff",  # MPI cross
-    "colour_group":          "#6464ff",  # group circle
-    "colour_miss":           "#3c3cd0",  # miss X marker
+    # Trace and shot colours (hex; converted to BGR at render time)
+    "colour_trace_approach": "#3c3c3c",
+    "colour_trace_hold":     "#28be50",
+    "colour_trace_preshot":  "#f0d000",
+    "colour_trace_final":    "#e03020",
+    "colour_shot_fill":      "#5050ff",
+    "colour_acp":            "#ffc800",
+    "colour_crosshair":      "#00dc64",
+    "colour_mpi":            "#50b4ff",
+    "colour_group":          "#6464ff",
+    "colour_miss":           "#3c3cd0",
 
-    # ── Trace behaviour ──────────────────────────────────────────────────────
-    "trace_width":            1,
-    "trace_preshot_s":        1.0,   # seconds before shot: trace turns yellow
-    "trace_final_s":          0.2,   # seconds before shot: trace turns red
-    "fading_trace_duration_s":2.0,   # how long post-shot trace lingers
-    "acp_fraction":           0.40,  # fraction of hold used for ACP
-    "approach_zone_factor":   2.0,   # approach zone = scoring_radius × this
+    # Trace behaviour
+    "trace_width": 1,
+    "trace_preshot_s": 1.0,
+    "trace_final_s": 0.2,
+    "fading_trace_duration_s": 2.0,
+    "acp_fraction": 0.40,
+    "approach_zone_factor": 2.0,
 
-    # ── Zero offset (persistent across restarts) ─────────────────────────────
+    # Persisted zero offset
     "zero_offset_x": 0.0,
     "zero_offset_y": 0.0,
 
-    # ── Session & files ──────────────────────────────────────────────────────
-    "session_name":       "Session",
-    "shooter_name":       "",
-    "shots_per_series":   10,
-    "save_directory":     "",    # empty = sessions/ folder next to the app
+    # Session & files
+    "session_name": "Session",
+    "shooter_name": "",
+    "shots_per_series": 10,
+    "save_directory": "",
 }
 
 
-def load_config():
-    """Load config. Returns (cfg, is_first_run)."""
+def load_config() -> Tuple[dict, bool]:
+    """Load the persisted config or return defaults.
+
+    Returns:
+        ``(cfg, is_first_run)``. ``is_first_run`` is true when no config
+        file exists or the existing one could not be parsed.
+    """
     cfg = DEFAULT_CONFIG.copy()
-    first_run = not os.path.exists(CONFIG_FILE)
-    if not first_run:
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                saved = json.load(f)
-            cfg.update(saved)
-        except Exception:
-            first_run = True  # corrupt config treated as first run
-    return cfg, first_run
-
-
-def save_config(cfg: dict):
+    if not os.path.exists(CONFIG_FILE):
+        return cfg, True
     try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg.update(json.load(f))
+        return cfg, False
+    except Exception:
+        return cfg, True
+
+
+def save_config(cfg: dict) -> None:
+    """Write the config to the user data dir, ignoring write errors."""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:

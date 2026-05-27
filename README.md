@@ -34,22 +34,48 @@ Changing the pellet calibre in Settings instantly shifts all scoring bands — o
 
 ## Requirements
 
-- Windows 10 or 11 (64-bit)
-- **Python 3.9+** — download from https://python.org — tick **"Add Python to PATH"** during installation
+- Windows 10/11, macOS 12+, or a recent 64-bit Linux desktop
 - A webcam (USB recommended for barrel-mounting; built-in works for testing)
 - A microphone (built-in laptop mic is fine for dry-fire; closer to the action is better for live fire)
+- **Python 3.9+** is only needed when running from source — pre-built binaries bundle their own runtime
 
 ---
 
-## Quick Start
+## Quick Start (pre-built binary)
 
-1. Install Python from https://python.org (tick "Add Python to PATH")
-2. Download or clone this repository
-3. Double-click **`RUN.bat`**
+Download the latest release for your OS from the [Releases page](../../releases/latest):
 
-That's it. `RUN.bat` automatically installs all Python dependencies (`numpy`, `opencv`, `sounddevice`, `Pillow`, `scipy`) the first time it runs, then launches Splatt2. On subsequent runs it checks for updates to dependencies and starts immediately.
+- `splatt2-windows-x64.zip`
+- `splatt2-macos-arm64.zip` (Apple Silicon) or `splatt2-macos-x64.zip` (Intel)
+- `splatt2-linux-x64.zip`
 
-> **To share with someone else:** give them the folder and tell them to install Python and double-click `RUN.bat`. No compilation, no installers, no antivirus drama.
+Unzip anywhere and launch:
+
+- **Windows** — run `splatt2.exe`
+- **macOS** — open `Splatt2.app` (right-click → Open the first time so Gatekeeper allows the unsigned bundle)
+- **Linux** — `chmod +x splatt2 && ./splatt2`
+
+User config and shooting sessions are saved to your OS-native app data folder:
+
+| OS      | Location                                               |
+| ------- | ------------------------------------------------------ |
+| Windows | `%APPDATA%\Splatt2`                                    |
+| macOS   | `~/Library/Application Support/Splatt2`                |
+| Linux   | `~/.local/share/Splatt2` (or `$XDG_DATA_HOME/Splatt2`) |
+
+Override with `SPLATT2_USER_DIR=/some/path` for testing or portable installs.
+
+---
+
+## Quick Start (run from source)
+
+1. Install Python 3.9+ from https://python.org (Windows: tick **"Add Python to PATH"**)
+2. Clone or download this repository
+3. Launch:
+   - **Windows** — double-click `RUN.bat`
+   - **macOS / Linux** — `pip install -r requirements.txt && python main.py`
+
+`RUN.bat` installs the Python deps (`numpy`, `opencv`, `sounddevice`, `Pillow`, `scipy`) on first run, then starts the app.
 
 ---
 
@@ -252,9 +278,11 @@ Open **Print Marker Sheet → Target Creator** tab to create or edit targets wit
 
 ## Session Files
 
-Sessions are saved in the `sessions/` folder (next to the app, or as configured in Settings). Each day of shooting creates a subfolder named `YYYY-MM-DD/`. Within each day, each series is a separate file named `HH-MM-SS_name_series1.csv`.
+Series recordings are saved to the `sessions/` folder inside your user data directory (see *Quick Start (pre-built binary)* for the per-OS path), or in a custom location configured in Settings → Session. Each day of shooting creates a subfolder named `YYYY-MM-DD/`. Within each day, each series is a separate file named `HH-MM-SS_name_series1.csv`.
 
 Each `.csv` has a companion `.json` file with full trace data for the Series Review window.
+
+> Splatt2 versions before this one stored the config and `sessions/` folder next to `main.py`. On first launch of a newer build, the config is migrated into the per-user app data directory automatically. The original is left in place.
 
 ---
 
@@ -313,13 +341,19 @@ Each `.csv` has a companion `.json` file with full trace data for the Series Rev
 ```
 splatt2/
 ├── main.py                  Entry point with crash logging
-├── RUN.bat                  Install dependencies & launch (double-click to run)
-├── requirements.txt         Python dependencies
-├── targets/                 Target definition CSV files — add your own here
+├── RUN.bat                  Install dependencies & launch (Windows dev flow)
+├── requirements.txt         Runtime Python dependencies
+├── requirements-build.txt   Build-time dependencies (PyInstaller)
+├── targets/                 Bundled target definition CSVs (read-only seeds)
 │   ├── 10m_air_rifle.csv
 │   ├── 10m_air_pistol.csv
 │   └── 6yd_air_rifle.csv
+├── build/
+│   ├── splatt2.spec         PyInstaller spec
+│   ├── build.py             Cross-platform build script
+│   └── README.md            Build instructions
 ├── core/
+│   ├── paths.py             Cross-platform resource and user-data paths
 │   ├── config.py            Settings management and target CSV loader
 │   ├── tracker.py           ArUco detection, homography, scoring geometry
 │   ├── audio.py             Shot sound detection (transient detection)
@@ -327,9 +361,38 @@ splatt2/
 │   ├── target_renderer.py   OpenCV target canvas drawing
 │   ├── marker_sheet.py      Printable ArUco sheet generator
 │   └── smoother.py          Aim-point smoothing (EMA / Savitzky-Golay)
-└── ui/
-    └── app.py               Main tkinter UI
+├── ui/
+│   └── app.py               Main tkinter UI
+└── .github/workflows/
+    ├── ci.yml               Syntax check on push and PR
+    └── release.yml          Cross-platform PyInstaller builds on tag
 ```
+
+---
+
+## Building from Source
+
+To produce a standalone bundle for your platform:
+
+```
+pip install -r requirements.txt -r requirements-build.txt
+python build/build.py --clean
+```
+
+Output lands in `dist/splatt2-<os>-<arch>/`. See [`build/README.md`](build/README.md) for per-OS notes.
+
+Pre-built binaries are produced automatically by GitHub Actions on every tag — see [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+### On-demand builds via GitHub Actions
+
+You can trigger the release workflow manually without pushing a tag:
+
+1. Go to **Actions → Release → Run workflow**
+2. Pick the branch
+3. Leave **Create a GitHub Release** unticked to just produce downloadable artifacts attached to the workflow run (kept for 30 days)
+4. Tick it and supply a tag (e.g. `v1.2.0-rc1`) to publish a pre-release with the zips attached
+
+Manual-dispatch releases are flagged as pre-releases so they don't override the latest stable.
 
 ---
 
