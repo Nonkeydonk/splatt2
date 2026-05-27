@@ -207,6 +207,10 @@ class SplattApp:
         self._tracking_lbl.pack(side="right", padx=8)
         _mk_btn(top, "📋  Series", self._open_series_tab).pack(
             side="right", padx=4, pady=8)
+        _mk_btn(top, "🖨  Target Sheet", self._print_markers).pack(
+            side="right", padx=4, pady=8)
+        _mk_btn(top, "💾  Save CSV", self._save_csv).pack(
+            side="right", padx=4, pady=8)
 
         # Body
         body = tk.Frame(self.root, bg=BG_DARK)
@@ -1911,7 +1915,24 @@ class SplattApp:
 
         tk.Button(dlg, text="Let's go  ▶", command=_done,
                   bg=ACCENT, fg=BG_DARK, font=("Segoe UI", 11, "bold"),
-                  relief="flat", padx=20, pady=8, cursor="hand2").pack(pady=20)
+                  relief="flat", padx=20, pady=8, cursor="hand2").pack(pady=(20, 4))
+
+        def _print_now():
+            # Persist current wizard choices so the sheet uses the right
+            # target/distance, then open the marker sheet dialog over the
+            # wizard. The user can return here when they're done.
+            try:
+                self.cfg["real_range_m"] = float(dist_var.get())
+            except ValueError:
+                pass
+            self.cfg["target_key"] = target_var.get()
+            self.target_cfg = TARGETS[self.cfg["target_key"]]
+            MarkerSheetDialog(dlg, self.cfg)
+
+        tk.Button(dlg, text="🖨  Print marker sheet now",
+                  command=_print_now,
+                  bg=BG_CARD, fg=TEXT_PRI, font=("Segoe UI", 9),
+                  relief="flat", padx=12, pady=4, cursor="hand2").pack(pady=(0, 16))
 
         # Prevent closing without completing
         dlg.protocol("WM_DELETE_WINDOW", _done)
