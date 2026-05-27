@@ -209,10 +209,12 @@ class SplattApp:
                                      bg=BG_MID, fg=TEXT_SEC, font=FH)
         self._session_lbl.pack(side="left", padx=8)
         self._status_lbl = tk.Label(top, text="● READY", bg=BG_MID,
-                                    fg=TEXT_SEC, font=("Consolas", 9))
+                                    fg=TEXT_SEC, font=("Consolas", 9),
+                                    width=60, anchor="e")
         self._status_lbl.pack(side="right", padx=16)
         self._tracking_lbl = tk.Label(top, text="TRACKING: —", bg=BG_MID,
-                                      fg=TEXT_DIM, font=("Consolas", 9))
+                                      fg=TEXT_DIM, font=("Consolas", 9),
+                                      width=14, anchor="e")
         self._tracking_lbl.pack(side="right", padx=8)
         _mk_btn(top, "📋  Series", self._open_series_tab).pack(
             side="right", padx=4, pady=8)
@@ -917,14 +919,43 @@ class SplattApp:
             self._set_status("ZEROED", ACCENT)
         ))
     def _update_loop(self):
-        # Target display and scores run always (even without camera)
-        # so colour changes / shot edits reflect immediately
+        """Drive periodic UI refreshes.
+
+        Live previews (camera frame, audio meter) run at ~30 Hz while
+        the camera is active. Score widgets and the shot log are only
+        refreshed when something has actually changed, which avoids
+        rebuilding the Text widget and 12 stat labels every tick.
+        """
         self._update_target_display()
-        self._update_scores()
+        self._refresh_score_widgets_if_dirty()
         if self._running:
             self._update_cam_display()
             self._update_audio_meter()
         self.root.after(33, self._update_loop)
+
+    def _refresh_score_widgets_if_dirty(self):
+        """Only repaint the score panel when its inputs have changed."""
+        ses = self.session
+        ss = ses.series_shots
+        sel_idx = (self._selected_shot.index
+                   if self._selected_shot is not None else None)
+        # Per-shot mutable bits (score, deletion, flags) feed into the
+        # signature so edits show up without rebuilding every frame.
+        shot_state = tuple(
+            (s.index, s.score, s.deleted, s.match_shot,
+             s.favourite, s.missed, bool(s.comments))
+            for s in ss
+        )
+        sig = (
+            shot_state, ses.current_series, sel_idx,
+            self._on_target_status, self._in_approach_zone,
+            self._show_bbox_shots, self._show_bbox_acp,
+            getattr(self, "_last_shot_info", None),
+        )
+        if sig == getattr(self, "_score_sig", None):
+            return
+        self._score_sig = sig
+        self._update_scores()
 
     def _update_cam_display(self):
         frame = self._latest_cam_frame
@@ -982,11 +1013,12 @@ class SplattApp:
         fading = self.session.get_fading_trace()
         fade_age = self.session.fading_age_s
 
-        # In editor mode pass only selected shots
+        # In editor mode, only render shots whose checkbox is ticked.
         if self._in_series_editor and self._editor_show_trace is not None:
+            shot_vars = self._editor_shot_vars
             sel_shots = [s for s in self.session.shots
-                         if self._editor_shot_vars.get(s.index,
-                             tk.BooleanVar(value=True)).get()]
+                         if s.index not in shot_vars
+                         or shot_vars[s.index].get()]
             show_tr  = self._editor_show_trace.get()
             show_acp = self._editor_show_acp.get()
         else:
@@ -1062,11 +1094,15 @@ class SplattApp:
         bbox = ses.bbox_shots_mm
         self._stat_labels["bbox_s"].config(
             text=f"{bbox[0]:.1f}×{bbox[1]:.1f}mm" if bbox and self._show_bbox_shots else "—")
-        acps = [s.aim_centrepoint for s in ss if s.aim_centrepoint]
-        if acps and self._show_bbox_acp:
-            ax = [a[0] for a in acps]; ay = [a[1] for a in acps]
-            self._stat_labels["bbox_a"].config(
-                text=f"{max(ax)-min(ax):.1f}×{max(ay)-min(ay):.1f}mm")
+        if self._show_bbox_acp:
+            acps = [s.aim_centrepoint for s in ss if s.aim_centrepoint]
+            if acps:
+                ax = [a[0] for a in acps]
+                ay = [a[1] for a in acps]
+                self._stat_labels["bbox_a"].config(
+                    text=f"{max(ax)-min(ax):.1f}×{max(ay)-min(ay):.1f}mm")
+            else:
+                self._stat_labels["bbox_a"].config(text="—")
         else:
             self._stat_labels["bbox_a"].config(text="—")
 
