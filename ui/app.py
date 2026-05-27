@@ -2551,9 +2551,10 @@ class SettingsDialog(tk.Toplevel):
         self.configure(bg=BG_DARK)
         self.resizable(True, True)
         self.grab_set()
-        self.geometry("560x680")
         self.minsize(480, 500)
+        self._tab_inners: list[tk.Frame] = []
         self._build()
+        self.after(60, self._size_to_content)
     def _build(self):
         # Fixed button row at BOTTOM (always visible)
         btn_row = tk.Frame(self, bg=BG_DARK)
@@ -2605,8 +2606,30 @@ class SettingsDialog(tk.Toplevel):
                          c.unbind_all("<MouseWheel>"))
 
             builder(inner)
+            self._tab_inners.append(inner)
             # Force scroll region now that content is populated
             self.after(50, _refresh)
+
+    def _size_to_content(self) -> None:
+        """Resize the dialog so the tallest tab fits without scrolling."""
+        if not self._tab_inners:
+            return
+        for inner in self._tab_inners:
+            inner.update_idletasks()
+        content_w = max(inner.winfo_reqwidth() for inner in self._tab_inners)
+        content_h = max(inner.winfo_reqheight() for inner in self._tab_inners)
+
+        # Add the chrome: notebook tabs, button row, scrollbar, padding.
+        chrome_w = 60
+        chrome_h = 110
+
+        # Cap to 90% of the screen so the dialog never overflows it.
+        max_w = int(self.winfo_screenwidth() * 0.9)
+        max_h = int(self.winfo_screenheight() * 0.9)
+
+        width = min(max_w, max(self.winfo_reqwidth(), content_w + chrome_w))
+        height = min(max_h, max(self.winfo_reqheight(), content_h + chrome_h))
+        self.geometry(f"{width}x{height}")
     def _row(self, parent, label, widget_fn):
         r = tk.Frame(parent, bg=BG_DARK)
         r.pack(fill="x", padx=12, pady=4)
