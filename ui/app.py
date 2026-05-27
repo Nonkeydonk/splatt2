@@ -36,7 +36,12 @@ from ui.theme import (
     ACCENT, ACCENT2, BG_CARD, BG_DARK, BG_MID, BG_PANEL, BORDER, GOLD,
     TEXT_DIM, TEXT_PRI, TEXT_SEC,
     FB, FH, FL, FM, FS, FT,
+    apply_theme as _apply_theme,
     make_button as _mk_btn,
+    make_toggle_button as _mk_toggle,
+    make_chip_button as _mk_chip,
+    set_toggle_state as _set_toggle,
+    set_button_variant as _set_variant,
 )
 
 
@@ -182,13 +187,17 @@ class SplattApp:
         self._editor_show_trace = tk.BooleanVar(value=True)
         self._editor_show_acp = tk.BooleanVar(value=True)
         self._editor_show_dur = tk.BooleanVar(value=True)
-        self._apply_styles()
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title(f"SPLATT2 v{VERSION} — Target Shooting Trainer")
         self.root.configure(bg=BG_DARK)
         self.root.minsize(1200, 750)
         self.root.geometry("1440x840")
+
+        # Theme must be applied before any widgets are created so the
+        # option database affects them. ttk.Style settings are applied
+        # to the root and inherited by widgets in any toplevel.
+        self._apply_styles()
 
         # Top bar
         top = tk.Frame(self.root, bg=BG_MID, height=46)
@@ -255,10 +264,9 @@ class SplattApp:
         self._focus_active = False
         ff_btn = tk.Frame(parent, bg=BG_PANEL)
         ff_btn.pack(fill="x", padx=6, pady=(0, 2))
-        self._btn_focus = tk.Button(ff_btn, text="◎ Focus assist: OFF",
-                                     command=self._toggle_focus_assist,
-                                     bg=BG_CARD, fg=TEXT_DIM, font=FL,
-                                     relief="flat", padx=6, pady=2, cursor="hand2")
+        self._btn_focus = _mk_toggle(ff_btn, "◎ Focus assist: OFF",
+                                     self._focus_active,
+                                     self._toggle_focus_assist)
         self._btn_focus.pack(side="left")
 
         self._focus_frame = tk.Frame(parent, bg=BG_PANEL)
@@ -372,51 +380,45 @@ class SplattApp:
             v.pack(side="right")
             self._stat_labels[key] = v
 
-        # Display toggles — two rows so nothing overflows 270px panel
-        def _tog_state(text_on, text_off, state):
-            return (text_on if state else text_off,
-                    ACCENT if state else BG_CARD,
-                    BG_DARK if state else TEXT_SEC)
-
-        def _tbtn(parent, text_on, text_off, state, cmd):
-            t, bg, fg = _tog_state(text_on, text_off, state)
-            return tk.Button(parent, text=t, bg=bg, fg=fg, font=FL,
-                             relief="flat", bd=0, padx=6, pady=4,
-                             cursor="hand2", command=cmd,
-                             activebackground=ACCENT, activeforeground=BG_DARK)
+        # Display toggles — two rows so nothing overflows 270px panel.
+        # Toggles use a clearly-distinct active style so it's obvious
+        # whether each overlay is on.
+        BLUE = "#4f8fff"
 
         # Row 1: ACP  Shots Box  ACP Box
         row1 = tk.Frame(parent, bg=BG_PANEL)
         row1.pack(fill="x", padx=6, pady=(2, 1))
-        self._btn_acp = _tbtn(row1, "◈ ACP", "◈ ACP",
-                               self._show_acp, self._toggle_acp)
-        self._btn_acp.config(bg=ACCENT if self._show_acp else BG_CARD,
-                              fg=BG_DARK if self._show_acp else TEXT_SEC)
+        self._btn_acp = _mk_toggle(row1, "◈ ACP", self._show_acp,
+                                   self._toggle_acp)
         self._btn_acp.pack(side="left", padx=(0, 2))
-        self._btn_bbox_s = _tbtn(row1, "⊡ Shots", "⊡ Shots",
-                                  self._show_bbox_shots, self._toggle_bbox_shots)
-        if self._show_bbox_shots:
-            self._btn_bbox_s.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_bbox_s = _mk_toggle(row1, "⊡ Shots", self._show_bbox_shots,
+                                      self._toggle_bbox_shots,
+                                      accent_color=BLUE)
         self._btn_bbox_s.pack(side="left", padx=(0, 2))
-        self._btn_bbox_a = _tbtn(row1, "◇ ACP Box", "◇ ACP Box",
-                                  self._show_bbox_acp, self._toggle_bbox_acp)
-        if self._show_bbox_acp:
-            self._btn_bbox_a.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_bbox_a = _mk_toggle(row1, "◇ ACP Box", self._show_bbox_acp,
+                                      self._toggle_bbox_acp,
+                                      accent_color=BLUE)
         self._btn_bbox_a.pack(side="left")
 
         # Row 2: Dot  Group circle
         row2 = tk.Frame(parent, bg=BG_PANEL)
         row2.pack(fill="x", padx=6, pady=(0, 3))
-        self._btn_dot = _tbtn(row2, "● Dot", "● Dot",
-                               self._shot_dot_only, self._toggle_dot_mode)
-        if self._shot_dot_only:
-            self._btn_dot.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_dot = _mk_toggle(row2, "● Dot", self._shot_dot_only,
+                                   self._toggle_dot_mode)
         self._btn_dot.pack(side="left", padx=(0, 2))
-        self._btn_group = _tbtn(row2, "○ Group", "○ Group",
-                                 self._show_group, self._toggle_group)
-        if self._show_group:
-            self._btn_group.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_group = _mk_toggle(row2, "○ Group", self._show_group,
+                                     self._toggle_group,
+                                     accent_color=GOLD)
         self._btn_group.pack(side="left")
+
+        # Remember each toggle's accent so updates use the same colour.
+        self._toggle_accents = {
+            id(self._btn_acp): ACCENT,
+            id(self._btn_bbox_s): BLUE,
+            id(self._btn_bbox_a): BLUE,
+            id(self._btn_dot): ACCENT,
+            id(self._btn_group): GOLD,
+        }
 
         # Shot log
         lc = tk.Frame(parent, bg=BG_CARD)
@@ -461,20 +463,23 @@ class SplattApp:
             side="left", padx=(8, 3), pady=5)
         self._btn_pause = parent.winfo_children()[-1]
 
-        self._btn_zero = _mk_btn(parent, "◎  Zero", self._toggle_zero_mode)
+        self._btn_zero = _mk_toggle(parent, "◎  Zero", False,
+                                    self._toggle_zero_mode,
+                                    accent_color=GOLD)
         self._btn_zero.pack(side="left", padx=(0, 2), pady=5)
-        self._btn_fine_zero = _mk_btn(parent, "⊕  Fine Zero",
-                                       self._toggle_fine_zero_mode)
+        self._btn_fine_zero = _mk_toggle(parent, "⊕  Fine Zero", False,
+                                         self._toggle_fine_zero_mode,
+                                         accent_color=GOLD)
         self._btn_fine_zero.pack(side="left", padx=(0, 3), pady=5)
 
-        self._btn_decimal = _mk_btn(
+        self._btn_decimal = _mk_toggle(
             parent, "DEC ON" if self._decimal_scoring else "DEC OFF",
-            self._toggle_decimal_scoring)
+            self._decimal_scoring, self._toggle_decimal_scoring)
         self._btn_decimal.pack(side="left", padx=(0, 8), pady=5)
 
         rot = self.cfg.get("camera_rotation", 0)
-        self._btn_rotate = _mk_btn(
-            parent, f"↻ {rot}°", self._cycle_rotation)
+        self._btn_rotate = _mk_toggle(
+            parent, f"↻ {rot}°", rot != 0, self._cycle_rotation)
         self._btn_rotate.pack(side="left", padx=(0, 8), pady=5)
 
         # Zoom slider
@@ -534,18 +539,8 @@ class SplattApp:
                  bg=BG_MID, fg=TEXT_DIM, font=FL).pack(side="right", padx=10)
 
     def _apply_styles(self):
-        s = ttk.Style()
-        s.theme_use("clam")
-        for name, col in [("Quality", ACCENT), ("Audio", "#4f8fff")]:
-            s.configure(f"{name}.Horizontal.TProgressbar",
-                        troughcolor=BG_DARK, background=col,
-                        bordercolor=BG_DARK, lightcolor=col, darkcolor=col)
-        s.configure("TScale", background=BG_MID, troughcolor=BG_CARD)
-        s.configure("TNotebook", background=BG_DARK, borderwidth=0)
-        s.configure("TNotebook.Tab", background=BG_CARD, foreground=TEXT_SEC,
-                    padding=[8, 3])
-        s.map("TNotebook.Tab", background=[("selected", BG_PANEL)],
-              foreground=[("selected", ACCENT)])
+        """Apply the dark ttk + tk option-database theme to the root."""
+        _apply_theme(self.root)
     def _scan_cameras(self):
         self._cam_combo.config(state="disabled")
         self._cam_combo["values"] = ["Scanning..."]
@@ -619,7 +614,8 @@ class SplattApp:
         self._camera_fps = actual_fps if actual_fps > 0 else target_fps
 
         self._running = True
-        self._btn_cam.config(text="■  Stop Camera", bg=ACCENT2, fg=BG_DARK)
+        self._btn_cam.configure(text="■  Stop Camera")
+        _set_variant(self._btn_cam, "danger")
         self._set_status("LIVE", ACCENT)
         self.audio.start()
         threading.Thread(target=self._camera_loop, daemon=True).start()
@@ -662,7 +658,8 @@ class SplattApp:
         if self._cap:
             self._cap.release()
             self._cap = None
-        self._btn_cam.config(text="▶  Start Camera", bg=BG_CARD, fg=TEXT_SEC)
+        self._btn_cam.configure(text="▶  Start Camera")
+        _set_variant(self._btn_cam, "accent")
         self._set_status("STOPPED", TEXT_DIM)
 
 
@@ -915,7 +912,8 @@ class SplattApp:
         self._last_shot_fired_time = time.time()
         self._save_zero_offset()
         self.root.after(0, lambda: (
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC),
+            self._btn_zero.configure(text="◎  Zero"),
+            _set_toggle(self._btn_zero, False, accent_color=GOLD),
             self._set_status("ZEROED", ACCENT)
         ))
     def _update_loop(self):
@@ -1165,12 +1163,13 @@ class SplattApp:
             self._sharpness        = 0.0
             self._focus_frame.pack(fill="x", padx=6, pady=(0, 2),
                                    after=self._btn_focus.master)
-            self._btn_focus.config(text="◎ Focus assist: ON", fg=ACCENT, bg=BG_MID)
+            self._btn_focus.config(text="◎ Focus assist: ON")
         else:
             self._focus_frame.pack_forget()
             self._sharpness_var.set(0)
             self._focus_lbl.config(text="—", fg=TEXT_DIM)
-            self._btn_focus.config(text="◎ Focus assist: OFF", fg=TEXT_DIM, bg=BG_CARD)
+            self._btn_focus.config(text="◎ Focus assist: OFF")
+        _set_toggle(self._btn_focus, self._focus_active)
 
     def _on_zoom_change(self, val=None):
         """Zoom slider changed — rebuild renderer at new scale."""
@@ -1196,10 +1195,12 @@ class SplattApp:
         self.audio.pause(self._paused)
         btn = self._btn_pause
         if self._paused:
-            btn.config(text="▶  Resume", bg=GOLD, fg=BG_DARK)
+            btn.configure(text="▶  Resume")
+            _set_variant(btn, "warn")
             self._set_status("PAUSED", GOLD)
         else:
-            btn.config(text="❙❙  Pause", bg=BG_CARD, fg=TEXT_SEC)
+            btn.configure(text="❙❙  Pause")
+            _set_variant(btn, "default")
             self._set_status("LIVE" if self._running else "READY", ACCENT)
 
     def _save_zero_offset(self):
@@ -1214,13 +1215,15 @@ class SplattApp:
             return
         self._zero_mode = not self._zero_mode
         if self._zero_mode:
-            self._btn_zero.config(text="◎  Waiting…", bg=GOLD, fg=BG_DARK)
+            self._btn_zero.config(text="◎  Waiting…")
+            _set_toggle(self._btn_zero, True, accent_color=GOLD)
             self._set_status("ZERO MODE — fire one shot", GOLD)
             # Cancel fine-zero if active
             if self._fine_zero_mode:
                 self._cancel_fine_zero()
         else:
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC)
+            self._btn_zero.config(text="◎  Zero")
+            _set_toggle(self._btn_zero, False, accent_color=GOLD)
             self._set_status("LIVE" if self._running else "READY", ACCENT)
 
     def _toggle_fine_zero_mode(self):
@@ -1229,22 +1232,23 @@ class SplattApp:
             self._cancel_fine_zero()
             return
         self._fine_zero_mode = True
-        self._btn_fine_zero.config(
-            text="⊕  Click centre…", bg=GOLD, fg=BG_DARK)
+        self._btn_fine_zero.config(text="⊕  Click centre…")
+        _set_toggle(self._btn_fine_zero, True, accent_color=GOLD)
         self._set_status(
             "FINE ZERO — click your shot group centre on the target", GOLD)
         # Cancel normal zero mode if active
         if self._zero_mode:
             self._zero_mode = False
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC)
+            self._btn_zero.config(text="◎  Zero")
+            _set_toggle(self._btn_zero, False, accent_color=GOLD)
         # Bind click on target canvas
         self._tgt_canvas.bind("<Button-1>", self._on_fine_zero_click)
         self._tgt_canvas.config(cursor="crosshair")
 
     def _cancel_fine_zero(self):
         self._fine_zero_mode = False
-        self._btn_fine_zero.config(
-            text="⊕  Fine Zero", bg=BG_CARD, fg=TEXT_SEC)
+        self._btn_fine_zero.config(text="⊕  Fine Zero")
+        _set_toggle(self._btn_fine_zero, False, accent_color=GOLD)
         self._tgt_canvas.unbind("<Button-1>")
         self._tgt_canvas.config(cursor="")
         self._set_status("LIVE" if self._running else "READY", ACCENT)
@@ -1276,9 +1280,8 @@ class SplattApp:
         self.cfg["decimal_scoring"] = self._decimal_scoring
         save_config(self.cfg)
         self._btn_decimal.config(
-            text="DEC ON"  if self._decimal_scoring else "DEC OFF",
-            bg=ACCENT if self._decimal_scoring else BG_CARD,
-            fg=BG_DARK if self._decimal_scoring else TEXT_SEC)
+            text="DEC ON" if self._decimal_scoring else "DEC OFF")
+        _set_toggle(self._btn_decimal, self._decimal_scoring)
 
     def _cycle_rotation(self):
         """Cycle camera rotation: 0 → 90 → 180 → 270 → 0."""
@@ -1286,16 +1289,15 @@ class SplattApp:
         self.cfg["camera_rotation"] = self._camera_rotation
         save_config(self.cfg)
         if hasattr(self, "_btn_rotate"):
-            self._btn_rotate.config(text=f"↻ {self._camera_rotation}°",
-                                    bg=BG_CARD if self._camera_rotation == 0 else ACCENT,
-                                    fg=TEXT_SEC if self._camera_rotation == 0 else BG_DARK)
+            self._btn_rotate.config(text=f"↻ {self._camera_rotation}°")
+            _set_toggle(self._btn_rotate, self._camera_rotation != 0)
 
     def _set_toggle_button(self, button: tk.Button, active: bool) -> None:
         """Apply the standard accent/idle styling to a toggle button."""
-        button.config(
-            bg=ACCENT if active else BG_CARD,
-            fg=BG_DARK if active else TEXT_SEC,
-        )
+        accent = ACCENT
+        if hasattr(self, "_toggle_accents"):
+            accent = self._toggle_accents.get(id(button), ACCENT)
+        _set_toggle(button, active, accent_color=accent)
 
     def _toggle_acp(self):
         self._show_acp = not self._show_acp
@@ -1348,8 +1350,9 @@ class SplattApp:
                     "Series is active. Stop recording and finish?"):
                 self.session.end_series()
                 self._series_started = False
-                self._btn_start_series.config(
-                    text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+                self._btn_start_series.configure(
+                    text="▶  Start Series")
+                _set_variant(self._btn_start_series, "accent")
                 self._set_status("Series stopped — file saved", GOLD)
             return
 
@@ -1375,9 +1378,9 @@ class SplattApp:
             return
 
         self._series_started = True
-        self._btn_start_series.config(
-            text="■  Series Active — click to stop",
-            bg=ACCENT2, fg=BG_DARK)
+        self._btn_start_series.configure(
+            text="■  Series Active — click to stop")
+        _set_variant(self._btn_start_series, "danger")
         sn = self.session.current_series
         self._set_status(f"● REC  Series {sn} — recording to {os.path.basename(path)}", ACCENT2)
 
@@ -1385,8 +1388,8 @@ class SplattApp:
         self.session.clear_series()
         self._series_started = False
         if hasattr(self, '_btn_start_series'):
-            self._btn_start_series.config(
-                text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+            self._btn_start_series.configure(text="▶  Start Series")
+            _set_variant(self._btn_start_series, "accent")
         self._selected_shot = None
         self._highlighted_trace = None
         self._set_status("READY — press Start Series", TEXT_SEC)
@@ -1403,10 +1406,11 @@ class SplattApp:
             self._series_started = False
             self._in_approach_zone = False
             self._in_series_editor = False
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC)
+            self._btn_zero.configure(text="◎  Zero")
+            _set_toggle(self._btn_zero, False, accent_color=GOLD)
             if hasattr(self, '_btn_start_series'):
-                self._btn_start_series.config(
-                    text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+                self._btn_start_series.configure(text="▶  Start Series")
+                _set_variant(self._btn_start_series, "accent")
             self._last_shot_lbl.config(text="Last shot: —", fg=TEXT_SEC)
             self._set_status("READY — press Start Series", TEXT_SEC)
             self._exit_series_editor()
@@ -1484,11 +1488,8 @@ class SplattApp:
         self._fine_zero_mode = False
         if hasattr(self, "_btn_rotate"):
             rot = self._camera_rotation
-            self._btn_rotate.config(
-                text=f"↻ {rot}°",
-                bg=BG_CARD if rot == 0 else ACCENT,
-                fg=TEXT_SEC if rot == 0 else BG_DARK,
-            )
+            self._btn_rotate.configure(text=f"↻ {rot}°")
+            _set_toggle(self._btn_rotate, rot != 0)
 
         self._zero_offset = (
             float(self.cfg.get("zero_offset_x", 0.0)),
@@ -1536,8 +1537,8 @@ class SplattApp:
             self.session.end_series()
             self._series_started = False
             if hasattr(self, '_btn_start_series'):
-                self._btn_start_series.config(
-                    text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+                self._btn_start_series.configure(text="▶  Start Series")
+                _set_variant(self._btn_start_series, "accent")
         SeriesReviewWindow(self.root, self.session, self.cfg,
                            self.target_cfg,
                            on_next_series=self._start_next_series,
@@ -1648,12 +1649,8 @@ class SplattApp:
         def _save():
             shot.comments = var.get().strip()
             dlg.destroy()
-        tk.Button(bf, text="Save", command=_save,
-                  bg=ACCENT, fg=BG_DARK, font=("Segoe UI", 9),
-                  relief="flat", padx=10, pady=4).pack(side="right", padx=4)
-        tk.Button(bf, text="Cancel", command=dlg.destroy,
-                  bg=BG_CARD, fg=TEXT_SEC, font=("Segoe UI", 9),
-                  relief="flat", padx=10, pady=4).pack(side="right")
+        _mk_btn(bf, "Save", _save, accent=True).pack(side="right", padx=4)
+        _mk_btn(bf, "Cancel", dlg.destroy).pack(side="right")
 
     def _delete_shot(self, shot):
         if messagebox.askyesno("Delete", f"Delete shot #{shot.index}?"):
@@ -1670,8 +1667,8 @@ class SplattApp:
         self.session.end_series()
         self._series_started = False
         if hasattr(self, '_btn_start_series'):
-            self._btn_start_series.config(
-                text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+            self._btn_start_series.configure(text="▶  Start Series")
+            _set_variant(self._btn_start_series, "accent")
         # Enter review mode
         self._in_series_editor = True
         for w in self._score_panel_frame.winfo_children():
@@ -1694,8 +1691,8 @@ class SplattApp:
         self._build_score_panel(self._score_panel_frame)
         self._set_status("READY — press Start Series", TEXT_SEC)
         if hasattr(self, '_btn_start_series'):
-            self._btn_start_series.config(
-                text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+            self._btn_start_series.configure(text="▶  Start Series")
+            _set_variant(self._btn_start_series, "accent")
 
     def _exit_series_editor(self):
         self._in_series_editor = False
@@ -1714,11 +1711,8 @@ class SplattApp:
         def _tog_btn(p, text, var, col=ACCENT):
             def cb():
                 var.set(not var.get())
-                btn.config(bg=col if var.get() else BG_CARD,
-                           fg=BG_DARK if var.get() else TEXT_SEC)
-            btn = _mk_btn(p, text, cb)
-            btn.config(bg=col if var.get() else BG_CARD,
-                       fg=BG_DARK if var.get() else TEXT_SEC)
+                _set_toggle(btn, var.get(), accent_color=col)
+            btn = _mk_toggle(p, text, var.get(), cb, accent_color=col)
             return btn
 
         _tog_btn(tog, "Trace",   self._editor_show_trace).pack(side="left", padx=(0,2))
@@ -1913,9 +1907,8 @@ class SplattApp:
             dlg.destroy()
             self._set_status("Setup complete — print your marker sheet and start the camera!", ACCENT)
 
-        tk.Button(dlg, text="Let's go  ▶", command=_done,
-                  bg=ACCENT, fg=BG_DARK, font=("Segoe UI", 11, "bold"),
-                  relief="flat", padx=20, pady=8, cursor="hand2").pack(pady=(20, 4))
+        _go_btn = _mk_btn(dlg, "Let's go  ▶", _done, accent=True)
+        _go_btn.pack(pady=(20, 4))
 
         def _print_now():
             # Persist current wizard choices so the sheet uses the right
@@ -1929,10 +1922,7 @@ class SplattApp:
             self.target_cfg = TARGETS[self.cfg["target_key"]]
             MarkerSheetDialog(dlg, self.cfg)
 
-        tk.Button(dlg, text="🖨  Print marker sheet now",
-                  command=_print_now,
-                  bg=BG_CARD, fg=TEXT_PRI, font=("Segoe UI", 9),
-                  relief="flat", padx=12, pady=4, cursor="hand2").pack(pady=(0, 16))
+        _mk_btn(dlg, "🖨  Print marker sheet now", _print_now).pack(pady=(0, 16))
 
         # Prevent closing without completing
         dlg.protocol("WM_DELETE_WINDOW", _done)
@@ -1996,10 +1986,9 @@ class MarkerSheetDialog(tk.Toplevel):
         tk.Entry(r4, textvariable=self._mvar, width=6, bg=BG_CARD, fg=TEXT_PRI,
                  insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
         for sz in [25, 35, 40, 50]:
-            tk.Button(r4, text=str(sz),
-                      command=lambda v=sz: (self._mvar.set(str(v)), self._preview()),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r4, str(sz),
+                     lambda v=sz: (self._mvar.set(str(v)),
+                                   self._preview())).pack(side="left", padx=2)
         self._mvar.trace_add("write", lambda *_: self._preview())
 
         r5 = tk.Frame(parent, bg=BG_DARK); r5.pack(fill="x", **pad)
@@ -2016,11 +2005,9 @@ class MarkerSheetDialog(tk.Toplevel):
         self._sheet_calibre = tk.StringVar(
             value=str(self.cfg.get("scoring_calibre_mm", 4.5)))
         for label, val in [("4.5 (.177)", "4.5"), ("5.6 (.22)", "5.6")]:
-            tk.Button(r7, text=label,
-                      command=lambda v=val: (self._sheet_calibre.set(v),
-                                            self._preview()),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r7, label,
+                     lambda v=val: (self._sheet_calibre.set(v),
+                                    self._preview())).pack(side="left", padx=2)
         tk.Entry(r7, textvariable=self._sheet_calibre, width=5, bg=BG_CARD,
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
                  font=FM).pack(side="left", padx=(4,0))
@@ -2061,12 +2048,8 @@ class MarkerSheetDialog(tk.Toplevel):
         self._info.pack(fill="x", padx=14, pady=8)
 
         bf = tk.Frame(parent, bg=BG_DARK); bf.pack(fill="x", padx=14, pady=(4, 14))
-        tk.Button(bf, text="Generate & Open", command=self._generate,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  padx=12, pady=6).pack(side="right", padx=4)
-        tk.Button(bf, text="Cancel", command=self.destroy,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  padx=12, pady=6).pack(side="right", padx=4)
+        _mk_btn(bf, "Generate & Open", self._generate, accent=True).pack(side="right", padx=4)
+        _mk_btn(bf, "Cancel", self.destroy).pack(side="right", padx=4)
         self._preview()
 
     def _get(self):
@@ -2138,9 +2121,8 @@ class MarkerSheetDialog(tk.Toplevel):
                                            width=30, font=FL)
         self._c_mode_combo.pack(side="left", padx=(0,6))
         self._c_mode_combo.bind("<<ComboboxSelected>>", self._on_creator_mode)
-        tk.Button(top, text="Delete", command=self._delete_target,
-                  bg=ACCENT2, fg=BG_DARK, font=FL, relief="flat",
-                  padx=6, pady=3, cursor="hand2").pack(side="left")
+        _del_btn = _mk_btn(top, "Delete", self._delete_target, danger=True)
+        _del_btn.pack(side="left")
         meta = tk.Frame(parent, bg=BG_DARK); meta.pack(fill="x", **pad)
 
         def _field(frame, label, var, width=20):
@@ -2182,11 +2164,9 @@ class MarkerSheetDialog(tk.Toplevel):
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
                  font=FM).pack(side="left")
         for lbl, val in [("4.5",4.5),("5.6",5.6)]:
-            tk.Button(r_cal, text=lbl,
-                      command=lambda v=val: (self._c_calibre.set(str(v)),
-                                            self._update_creator_preview()),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=1, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_cal, lbl,
+                     lambda v=val: (self._c_calibre.set(str(v)),
+                                    self._update_creator_preview())).pack(side="left", padx=2)
         tk.Label(r_cal, text="  Card dia (mm):", bg=BG_DARK, fg=TEXT_SEC,
                  font=FB).pack(side="left", padx=(8,0))
         tk.Entry(r_cal, textvariable=self._c_card, width=6, bg=BG_CARD,
@@ -2219,9 +2199,7 @@ class MarkerSheetDialog(tk.Toplevel):
                                    font=FM, anchor="w")
         self._c_status.pack(fill="x", padx=10)
         bf = tk.Frame(parent, bg=BG_DARK); bf.pack(fill="x", padx=10, pady=(2,8))
-        tk.Button(bf, text="Save Target", command=self._save_target,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  padx=12, pady=5, cursor="hand2").pack(side="right")
+        _mk_btn(bf, "Save Target", self._save_target, accent=True).pack(side="right")
 
         self._update_creator_preview()
 
@@ -2580,15 +2558,10 @@ class SettingsDialog(tk.Toplevel):
         # Fixed button row at BOTTOM (always visible)
         btn_row = tk.Frame(self, bg=BG_DARK)
         btn_row.pack(side="bottom", fill="x", padx=8, pady=8)
-        tk.Button(btn_row, text="Apply & Close", command=self._apply_and_close,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  padx=12, pady=7).pack(side="right", padx=4)
-        tk.Button(btn_row, text="Apply", command=self._apply,
-                  bg=BG_CARD, fg=ACCENT, font=FB, relief="flat",
-                  padx=12, pady=7).pack(side="right", padx=4)
-        tk.Button(btn_row, text="Cancel", command=self.destroy,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  padx=12, pady=7).pack(side="right", padx=4)
+        _mk_btn(btn_row, "Apply & Close", self._apply_and_close,
+                accent=True).pack(side="right", padx=4)
+        _mk_btn(btn_row, "Apply", self._apply).pack(side="right", padx=4)
+        _mk_btn(btn_row, "Cancel", self.destroy).pack(side="right", padx=4)
         self._status_lbl = tk.Label(btn_row, text="", bg=BG_DARK,
                                      fg=ACCENT, font=FL)
         self._status_lbl.pack(side="left", padx=8)
@@ -2680,11 +2653,10 @@ class SettingsDialog(tk.Toplevel):
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
         for lbl, (w, h) in [("480×360",(480,360)),("640×480",(640,480)),
                              ("1280×720",(1280,720))]:
-            tk.Button(r, text=lbl,
-                      command=lambda w=w,h=h: (self._v_video_width.set(str(w)),
-                                               self._v_video_height.set(str(h))),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r, lbl,
+                     lambda w=w,h=h: (self._v_video_width.set(str(w)),
+                                      self._v_video_height.set(str(h)))
+                     ).pack(side="left", padx=2)
 
         # FPS
         r2 = tk.Frame(tab, bg=BG_DARK); r2.pack(fill="x", padx=12, pady=4)
@@ -2694,13 +2666,11 @@ class SettingsDialog(tk.Toplevel):
         tk.Entry(r2, textvariable=self._v_video_fps, width=5, bg=BG_CARD,
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
         for fps in [30, 60, 120]:
-            tk.Button(r2, text=str(fps),
-                      command=lambda f=fps: self._v_video_fps.set(str(f)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
-        tk.Button(r2, text="Detect", command=self._detect_camera_caps,
-                  bg=BG_CARD, fg=ACCENT, font=FL, relief="flat",
-                  padx=6, pady=2, cursor="hand2").pack(side="left", padx=(8, 0))
+            _mk_chip(r2, str(fps),
+                     lambda f=fps: self._v_video_fps.set(str(f))
+                     ).pack(side="left", padx=2)
+        _mk_chip(r2, "Detect", self._detect_camera_caps).pack(
+            side="left", padx=(8, 0))
         self._cam_caps_lbl = tk.Label(r2, text="", bg=BG_DARK, fg=TEXT_DIM, font=FL)
         self._cam_caps_lbl.pack(side="left", padx=4)
 
@@ -2797,10 +2767,9 @@ class SettingsDialog(tk.Toplevel):
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
                  font=FM).pack(side="left")
         for lbl, val in [("2",2.0),("4",4.0),("6",6.0),("8",8.0),("12",12.0)]:
-            tk.Button(r_cc, text=lbl,
-                      command=lambda v=val: self._v_clahe_clip.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_cc, lbl,
+                     lambda v=val: self._v_clahe_clip.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_cc, text="  2=mild  4=balanced  8=aggressive  12=extreme",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2814,10 +2783,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for lbl, val in [("64",64),("96",96),("128",128),("160",160),("192",192)]:
-            tk.Button(r_bt, text=lbl,
-                      command=lambda v=val: self._v_brightness_target.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_bt, lbl,
+                     lambda v=val: self._v_brightness_target.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_bt, text="  lower=darker/faster  128=balanced  higher=brighter",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2835,10 +2803,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for lbl, val in [("15",15),("20",20),("25",25),("35",35),("50",50)]:
-            tk.Button(r_sv, text=lbl,
-                      command=lambda v=val: self._v_spike_velocity_mm.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_sv, lbl,
+                     lambda v=val: self._v_spike_velocity_mm.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_sv, text="  lower=more sensitive  25=default  higher=less sensitive",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2851,10 +2818,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for lbl, val in [("0.5",0.5),("0.6",0.6),("0.7",0.7),("0.8",0.8),("0.9",0.9)]:
-            tk.Button(r_sr, text=lbl,
-                      command=lambda v=val: self._v_spike_reversal.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_sr, lbl,
+                     lambda v=val: self._v_spike_reversal.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_sr, text="  0.5=loose  0.7=default  0.9=strict",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2894,11 +2860,9 @@ class SettingsDialog(tk.Toplevel):
                                      font=FM)
         self._zero_x_lbl.pack(side="left")
         self._update_zero_display()
-        tk.Button(r_zo, text="Reset to (0, 0)",
-                  command=self._reset_zero_offset,
-                  bg=ACCENT2, fg=BG_DARK, font=FL, relief="flat",
-                  padx=8, pady=3, cursor="hand2"
-                  ).pack(side="right")
+        _reset_zero_btn = _mk_btn(r_zo, "Reset to (0, 0)",
+                                  self._reset_zero_offset, danger=True)
+        _reset_zero_btn.pack(side="right")
 
         tk.Label(tab, text="Shot Handling", bg=BG_DARK, fg=ACCENT,
                  font=FT).pack(anchor="nw", padx=12, pady=(10, 4))
@@ -2915,10 +2879,9 @@ class SettingsDialog(tk.Toplevel):
                              insertbackground=ACCENT, relief="flat", font=FM)
         cal_entry.pack(side="left")
         for label, val in [("4.5",4.5),("5.6",5.6)]:
-            tk.Button(r_cal, text=label,
-                      command=lambda v=val: self._v_scoring_calibre.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_cal, label,
+                     lambda v=val: self._v_scoring_calibre.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_cal, text="  affects scoring bands & approach zone",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2952,15 +2915,11 @@ class SettingsDialog(tk.Toplevel):
         setattr(self, "_v_save_directory", v)
         tk.Entry(r, textvariable=v, width=22, bg=BG_CARD, fg=TEXT_PRI,
                  insertbackground=ACCENT, relief="flat", font=FM).pack(side="left", padx=(0,4))
-        tk.Button(r, text="Browse…", command=self._browse_save_dir,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FL, relief="flat",
-                  padx=6, pady=3, cursor="hand2").pack(side="left")
+        _mk_chip(r, "Browse…", self._browse_save_dir).pack(side="left")
         def _use_default():
             v.set("")
             self._status_lbl.config(text="Reset to default location")
-        tk.Button(r, text="↺ Default", command=_use_default,
-                  bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                  padx=6, pady=3, cursor="hand2").pack(side="left", padx=2)
+        _mk_chip(r, "↺ Default", _use_default).pack(side="left", padx=2)
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
     def _build_colours(self, tab):
         self._note(tab, "Click a swatch to pick a colour. Changes apply on Apply.")
@@ -2991,10 +2950,9 @@ class SettingsDialog(tk.Toplevel):
                  font=FB, width=24, anchor="w").pack(side="left")
         self._v_trace_width = tk.StringVar(value=str(self.cfg.get("trace_width", 1)))
         for w in [1, 2, 3, 4]:
-            tk.Button(r, text=str(w),
-                      command=lambda v=w: self._v_trace_width.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FB, relief="flat",
-                      padx=8, pady=3, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r, str(w),
+                     lambda v=w: self._v_trace_width.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Entry(r, textvariable=self._v_trace_width, width=3,
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left", padx=4)
@@ -3008,10 +2966,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for s in [1, 2, 4, 8]:
-            tk.Button(r2, text=str(s),
-                      command=lambda v=s: self._v_fading_trace_duration_s.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r2, str(s),
+                     lambda v=s: self._v_fading_trace_duration_s.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
 
     def _colour_row(self, parent, label: str, key: str):
@@ -3046,9 +3003,7 @@ class SettingsDialog(tk.Toplevel):
                                title=f"Choose colour — {label}")
             if result and result[1]:
                 v.set(result[1].upper())
-        tk.Button(r, text="Pick…", command=_pick,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FL, relief="flat",
-                  padx=6, pady=2, cursor="hand2").pack(side="left", padx=(4, 0))
+        _mk_chip(r, "Pick…", _pick).pack(side="left", padx=(4, 0))
     def _build_advanced(self, tab):
         self._section(tab, "Shooter Profile")
         self._row(tab, "Shooter name",
@@ -3280,9 +3235,8 @@ class SeriesReviewWindow(tk.Toplevel):
         self._series_combo.pack(side="left", pady=10)
         self._series_combo.bind("<<ComboboxSelected>>", self._on_series_selected)
 
-        tk.Button(top, text="⟳", command=self._populate_series_picker,
-                  bg=BG_MID, fg=TEXT_SEC, font=FL, relief="flat",
-                  cursor="hand2", padx=6).pack(side="left", padx=4)
+        _mk_btn(top, "⟳", self._populate_series_picker).pack(
+            side="left", padx=4)
 
         self._view_lbl = tk.Label(top, text="", bg=BG_MID, fg=TEXT_DIM, font=FL)
         self._view_lbl.pack(side="right", padx=12)
@@ -3364,14 +3318,10 @@ class SeriesReviewWindow(tk.Toplevel):
         hdr.pack(fill="x", padx=6, pady=(4, 2))
         tk.Label(hdr, text="SHOTS  (✓=show, ✕=delete)",
                  bg=BG_CARD, fg=TEXT_DIM, font=FL).pack(side="left")
-        tk.Button(hdr, text="All",
-                  command=lambda: self._select_all(True),
-                  bg=BG_CARD, fg=TEXT_DIM, font=FL,
-                  relief="flat", padx=4, cursor="hand2").pack(side="right")
-        tk.Button(hdr, text="None",
-                  command=lambda: self._select_all(False),
-                  bg=BG_CARD, fg=TEXT_DIM, font=FL,
-                  relief="flat", padx=4, cursor="hand2").pack(side="right")
+        _mk_chip(hdr, "All",
+                 lambda: self._select_all(True)).pack(side="right")
+        _mk_chip(hdr, "None",
+                 lambda: self._select_all(False)).pack(side="right")
 
         # Scrollable shot rows
         sf2 = tk.Frame(lc, bg=BG_DARK)
@@ -3400,32 +3350,18 @@ class SeriesReviewWindow(tk.Toplevel):
         self._list_canvas.bind("<MouseWheel>", _wheel)
         bf = tk.Frame(parent, bg=BG_PANEL)
         bf.pack(fill="x", padx=6, pady=(0, 6))
-        tk.Button(bf, text="▶  Next Series",
-                  command=self._next_series,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  pady=6, cursor="hand2").pack(fill="x", pady=1)
-        tk.Button(bf, text="💾  Save CSV",
-                  command=self._save,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  pady=5, cursor="hand2").pack(fill="x", pady=1)
-        tk.Button(bf, text="✕  Close",
-                  command=self._on_close,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  pady=5, cursor="hand2").pack(fill="x", pady=1)
+        _mk_btn(bf, "▶  Next Series", self._next_series,
+                accent=True).pack(fill="x", pady=1)
+        _mk_btn(bf, "💾  Save CSV", self._save).pack(fill="x", pady=1)
+        _mk_btn(bf, "✕  Close", self._on_close).pack(fill="x", pady=1)
 
     def _make_tog_btn(self, parent, text, var, col):
         """Create a toggle button that actually works — no closure bug."""
         def toggle():
             var.set(not var.get())
-            btn.config(
-                bg=col    if var.get() else BG_CARD,
-                fg=BG_DARK if var.get() else TEXT_SEC)
+            _set_toggle(btn, var.get(), accent_color=col)
             self._redraw()
-        btn = tk.Button(parent, text=text, command=toggle,
-                        bg=col    if var.get() else BG_CARD,
-                        fg=BG_DARK if var.get() else TEXT_SEC,
-                        font=FL, relief="flat", bd=0,
-                        padx=6, pady=4, cursor="hand2")
+        btn = _mk_toggle(parent, text, var.get(), toggle, accent_color=col)
         return btn
     def _populate_series_picker(self):
         """Build the day + series dropdowns from live session and saved files."""
@@ -3583,11 +3519,9 @@ class SeriesReviewWindow(tk.Toplevel):
 
             # Delete button — only for live editable sessions
             if self._is_live:
-                tk.Button(row, text="✕",
-                          command=lambda s=shot: self._delete_shot(s),
-                          bg=BG_DARK, fg=ACCENT2,
-                          font=("Consolas", 9), relief="flat", bd=0,
-                          padx=3, cursor="hand2").pack(side="right")
+                _mk_chip(row, "✕",
+                         lambda s=shot: self._delete_shot(s)
+                         ).pack(side="right")
 
     def _on_shot_toggle(self, shot, var):
         shot.deleted = not var.get()
