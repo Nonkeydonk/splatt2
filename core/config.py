@@ -212,8 +212,8 @@ DEFAULT_CONFIG = {
 
     # Camera
     "camera_index": 0,
-    "video_width": 640,
-    "video_height": 480,
+    "video_width": 1920,
+    "video_height": 1080,
     "video_fps": 30,
     "camera_rotation": 0,
     "flip_image": False,
@@ -224,6 +224,17 @@ DEFAULT_CONFIG = {
     "brightness_target": 128.0,
     "spike_velocity_mm": 25.0,
     "spike_reversal": 0.7,
+    # Unsharp-mask amount applied after CLAHE. 0 disables; 0.5 - 1.5
+    # is the useful range for crisping up soft marker edges.
+    "sharpen": 0.0,
+    # Cap for the frame size handed to the ArUco detector. Lower is
+    # faster; higher preserves more pixels per marker, which matters
+    # when the camera is far from the printed sheet.
+    "detection_max_width": 1920,
+    "detection_max_height": 1080,
+    # Digital zoom applied before detection. 1.0 disables; values up
+    # to 4.0 centre-crop the frame so distant markers fill more pixels.
+    "camera_zoom": 1.0,
 
     # ArUco tracking
     "aruco_dict": "DICT_4X4_50",

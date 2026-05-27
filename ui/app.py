@@ -125,6 +125,7 @@ class SplattApp:
             clahe_clip=float(self.cfg.get("clahe_clip", 4.0)),
             marker_count=int(self.cfg.get("aruco_marker_count", 4)),
             brightness_target=float(self.cfg.get("brightness_target", 128.0)),
+            sharpen=float(self.cfg.get("sharpen", 0.0)),
         )
         self.target_renderer = None
 
@@ -167,6 +168,10 @@ class SplattApp:
         self._zero_mode = False
         self._decimal_scoring = self.cfg.get("decimal_scoring", False)
         self._zoom_factor = 1.0
+        # Digital zoom on the captured frame: crops the centre of each
+        # frame before detection so distant marker sheets get more
+        # pixels per marker. 1.0 means no crop.
+        self._cam_zoom = float(self.cfg.get("camera_zoom", 1.0))
         self._live_fps = 0.0
         self._sharpness = 0.0
         self._sharpness_peak = 0.0
@@ -314,6 +319,22 @@ class SplattApp:
         self._quality_var = tk.DoubleVar()
         ttk.Progressbar(qf, variable=self._quality_var, maximum=100, length=160,
                         style="Quality.Horizontal.TProgressbar").pack(side="left", padx=4)
+
+        # Camera digital zoom (centre crop). Useful when the target
+        # sheet is far from the camera and markers are too small for
+        # ArUco to detect reliably.
+        zf = tk.Frame(parent, bg=BG_PANEL)
+        zf.pack(fill="x", padx=6, pady=(0, 2))
+        tk.Label(zf, text="ZOOM", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=FL).pack(side="left")
+        self._cam_zoom_var = tk.DoubleVar(value=self._cam_zoom)
+        ttk.Scale(zf, from_=1.0, to=4.0, variable=self._cam_zoom_var,
+                  orient="horizontal", length=140,
+                  command=self._on_cam_zoom_change).pack(side="left", padx=4)
+        self._cam_zoom_lbl = tk.Label(
+            zf, text=f"{self._cam_zoom:.1f}×", bg=BG_PANEL, fg=ACCENT,
+            font=("Consolas", 9), width=5)
+        self._cam_zoom_lbl.pack(side="left")
 
         # Camera selector
         sf = tk.Frame(parent, bg=BG_PANEL)
@@ -771,15 +792,17 @@ class SplattApp:
         UI thread blocks while the loop is mid-``cap.read()``.
 
         - BUFFERSIZE=1 means cap.read() always returns the freshest frame
-        - Frame is downscaled to max 480p for ArUco detection regardless of
-          capture resolution — this is the single biggest speed gain
+        - Frame is downscaled to a configurable cap for ArUco detection
+          (default 640x480). At long range this can be raised so markers
+          keep enough pixels per side to be detected reliably.
         - UI preview is only updated every N frames to save tkinter overhead
         - 'no_video_mode': skip annotated frame entirely, pure tracking only
         """
         no_video = self.cfg.get("no_video_mode", False)
         ui_every = 3
         ui_counter = 0
-        detect_w, detect_h = 640, 480
+        detect_w = int(self.cfg.get("detection_max_width", 640))
+        detect_h = int(self.cfg.get("detection_max_height", 480))
         fps = _FpsCounter()
 
         try:
@@ -796,6 +819,8 @@ class SplattApp:
                 rotation = _ROTATION_FLAGS.get(self._camera_rotation)
                 if rotation is not None:
                     frame = cv2.rotate(frame, rotation)
+                if self._cam_zoom > 1.001:
+                    frame = self._apply_camera_zoom(frame, self._cam_zoom)
 
                 small = self._downscale_for_detection(frame, detect_w, detect_h)
                 if self._focus_active:
@@ -837,6 +862,21 @@ class SplattApp:
             frame, (int(fw * scale), int(fh * scale)),
             interpolation=cv2.INTER_LINEAR,
         )
+
+    @staticmethod
+    def _apply_camera_zoom(frame, zoom: float):
+        """Centre-crop ``frame`` so it occupies ``1/zoom`` of each axis.
+
+        This is digital zoom: the cropped region is returned as-is and
+        downstream stages (resize for detection, draw, present) operate
+        on a smaller frame with proportionally larger marker pixels.
+        """
+        fh, fw = frame.shape[:2]
+        cw = max(1, int(fw / zoom))
+        ch = max(1, int(fh / zoom))
+        x0 = (fw - cw) // 2
+        y0 = (fh - ch) // 2
+        return frame[y0:y0 + ch, x0:x0 + cw]
 
     @staticmethod
     def _measure_sharpness(frame) -> float:
@@ -1344,6 +1384,13 @@ class SplattApp:
             self._zoom_lbl.config(text=f"{self._zoom_factor:.2f}×")
         self.target_renderer = None   # force rebuild on next frame
 
+    def _on_cam_zoom_change(self, _val=None):
+        """Camera digital-zoom slider changed."""
+        self._cam_zoom = round(float(self._cam_zoom_var.get()), 1)
+        self._cam_zoom_lbl.config(text=f"{self._cam_zoom:.1f}×")
+        self.cfg["camera_zoom"] = self._cam_zoom
+        save_config(self.cfg)
+
     def _on_thresh_change(self, val=None):
         v = self._thresh_var.get()
         self.audio.set_threshold(v)
@@ -1648,6 +1695,7 @@ class SplattApp:
                 marker_count=int(self.cfg.get("aruco_marker_count", 4)),
                 brightness_target=float(
                     self.cfg.get("brightness_target", 128.0)),
+                sharpen=float(self.cfg.get("sharpen", 0.0)),
             )
 
         self._camera_rotation = int(self.cfg.get("camera_rotation", 0))

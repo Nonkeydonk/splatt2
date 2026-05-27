@@ -114,6 +114,7 @@ class ArucoTracker:
         clahe_clip: float = 4.0,
         marker_count: int = 4,
         brightness_target: float = 128.0,
+        sharpen: float = 0.0,
     ):
         self.board_width_mm = board_width_mm
         self.board_height_mm = board_height_mm
@@ -121,12 +122,25 @@ class ArucoTracker:
         self.margin_mm = margin_mm
         self.use_clahe = use_clahe
         self.brightness_target = float(brightness_target)
+        # Unsharp-mask amount applied after CLAHE. 0 disables; the
+        # useful range is roughly 0.3 - 1.5 for crisping up soft
+        # marker edges at distance.
+        self.sharpen = max(0.0, float(sharpen))
 
         dict_id = getattr(cv2.aruco, aruco_dict_name, cv2.aruco.DICT_4X4_50)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
         self.detector_params = cv2.aruco.DetectorParameters()
         self.detector_params.cornerRefinementMethod = (
             cv2.aruco.CORNER_REFINE_SUBPIX)
+        # Allow markers slightly smaller than the 3% default so 4-marker
+        # boards stay detected when zoomed/cropped tight at distance.
+        self.detector_params.minMarkerPerimeterRate = 0.02
+        # Widen the adaptive threshold sweep so a marker isn't missed
+        # purely because the default window size is wrong for the
+        # current frame size.
+        self.detector_params.adaptiveThreshWinSizeMin = 3
+        self.detector_params.adaptiveThreshWinSizeMax = 23
+        self.detector_params.adaptiveThreshWinSizeStep = 10
         self.detector = cv2.aruco.ArucoDetector(
             self.aruco_dict, self.detector_params)
 
@@ -191,16 +205,28 @@ class ArucoTracker:
         return result
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """Greyscale, software gain normalisation, then CLAHE."""
+        """Greyscale, software gain normalisation, then CLAHE.
+
+        An optional unsharp mask runs after CLAHE to tighten marker
+        edges that have been softened by lens blur or downscaling.
+        """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if not self.use_clahe:
-            return gray
-        mean = float(np.mean(gray))
-        if mean > 1.0:
-            scale = self.brightness_target / mean
-            gray = np.clip(
-                gray.astype(np.float32) * scale, 0, 255).astype(np.uint8)
-        return self._clahe.apply(gray)
+        if self.use_clahe:
+            mean = float(np.mean(gray))
+            if mean > 1.0:
+                scale = self.brightness_target / mean
+                gray = np.clip(
+                    gray.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+            gray = self._clahe.apply(gray)
+        if self.sharpen > 0.0:
+            gray = self._unsharp_mask(gray, self.sharpen)
+        return gray
+
+    @staticmethod
+    def _unsharp_mask(gray: np.ndarray, amount: float) -> np.ndarray:
+        """Sharpen by subtracting a Gaussian-blurred copy of the image."""
+        blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.5, sigmaY=1.5)
+        return cv2.addWeighted(gray, 1.0 + amount, blurred, -amount, 0)
 
     def _try_reuse_homography(
         self, result: TrackFrame, frame: np.ndarray,
