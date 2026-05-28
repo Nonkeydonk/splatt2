@@ -1,23 +1,20 @@
-"""
-core/audio.py
-Shot detection via transient (percussive click) detection.
+"""Shot detection from microphone audio.
 
-For dry-firing, a click is a very short-duration, high-amplitude transient —
-not a sustained loud noise. The detector works by:
-  1. Tracking a rolling RMS baseline (ambient noise floor)
-  2. Computing a short-window peak
-  3. Firing when peak / baseline > transient_ratio AND peak > abs_threshold
-  4. Enforcing a cooldown to prevent double-triggers
-
-This approach rejects: sustained talking, chair noise, HVAC hum.
-It accepts: a sharp click/snap that is N× louder than the room baseline.
+A shot click is a short, sharp transient: very high amplitude over a very
+short window. The detector tracks a rolling RMS baseline and fires when a
+peak both exceeds an absolute threshold and is several times louder than
+the baseline. This rejects steady-state noise (talking, fans) while
+accepting genuine clicks.
 """
 
+from __future__ import annotations
+
+import collections
 import threading
 import time
-import collections
+from typing import Callable, Deque, Optional
+
 import numpy as np
-from typing import Callable, Optional, Deque
 
 try:
     import sounddevice as sd
@@ -25,19 +22,26 @@ try:
 except ImportError:
     SD_AVAILABLE = False
 
-WAVEFORM_SAMPLES = 300   # history length for waveform display (frames)
+
+WAVEFORM_SAMPLES = 300
+"""Number of recent RMS values kept for the live waveform display."""
 
 
 class AudioDetector:
-    """
-    Parameters
-    ----------
-    threshold        : absolute peak threshold (0–1). Acts as a floor —
-                       quiet rooms can use 0.05, louder rooms 0.15–0.3.
-    transient_ratio  : peak must be this many times the rolling baseline RMS.
-                       Typical: 4–8. Higher = only sharp spikes trigger.
-    cooldown_ms      : min ms between triggers
-    baseline_window  : number of chunks used for rolling baseline
+    """Detect gunshot-like transients on a microphone input stream.
+
+    Args:
+        threshold: Absolute peak floor in [0, 1]. Quiet rooms can use 0.05;
+            louder ones 0.15-0.3.
+        transient_ratio: Peak must exceed the rolling baseline RMS by this
+            factor before triggering. Higher values reject steadier sounds.
+        cooldown_ms: Minimum time between successive triggers.
+        sample_rate: Microphone sample rate in Hz.
+        chunk_size: Samples per callback. ~12 ms at 44.1 kHz keeps latency
+            low while still capturing the full transient.
+        device_index: Input device index, or ``None`` for the system default.
+        on_shot: Callback invoked with the trigger timestamp when a shot is
+            detected.
     """
 
     def __init__(
@@ -46,9 +50,9 @@ class AudioDetector:
         transient_ratio: float = 6.0,
         cooldown_ms: int = 800,
         sample_rate: int = 44100,
-        chunk_size: int = 512,            # ~12ms chunks — low latency transient detection
+        chunk_size: int = 512,
         device_index: Optional[int] = None,
-        on_shot: Optional[Callable] = None,
+        on_shot: Optional[Callable[[float], None]] = None,
     ):
         self.threshold = threshold
         self.transient_ratio = transient_ratio
@@ -64,21 +68,20 @@ class AudioDetector:
         self._paused = False
         self._lock = threading.Lock()
 
-        # Live display data (thread-safe via deque)
-        self.current_level: float = 0.0       # latest RMS (for bar meter)
-        self.current_peak: float = 0.0        # latest peak
-        self.current_baseline: float = 0.0    # rolling baseline
-        self.last_trigger_level: float = 0.0  # peak at last trigger
+        # Live display state, read by the UI thread.
+        self.current_level: float = 0.0
+        self.current_peak: float = 0.0
+        self.current_baseline: float = 0.0
+        self.last_trigger_level: float = 0.0
         self._waveform: Deque[float] = collections.deque(
             [0.0] * WAVEFORM_SAMPLES, maxlen=WAVEFORM_SAMPLES)
 
-        # Rolling baseline: median of recent chunk RMSes
+        # Rolling baseline: percentile over recent chunk RMSes.
         self._baseline_buf: Deque[float] = collections.deque(
             [0.001] * 40, maxlen=40)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def start(self):
+    def start(self) -> None:
+        """Open the input stream and begin processing audio."""
         if not SD_AVAILABLE:
             print("[Audio] sounddevice not available.")
             return
@@ -99,7 +102,8 @@ class AudioDetector:
             print(f"[Audio] Stream error: {e}")
             self._running = False
 
-    def stop(self):
+    def stop(self) -> None:
+        """Stop and close the input stream."""
         self._running = False
         if self._stream is not None:
             try:
@@ -109,56 +113,51 @@ class AudioDetector:
                 pass
             self._stream = None
 
-    def pause(self, paused: bool):
+    def pause(self, paused: bool) -> None:
+        """Suspend or resume trigger detection without closing the stream."""
         with self._lock:
             self._paused = paused
 
-    def set_threshold(self, value: float):
+    def set_threshold(self, value: float) -> None:
         self.threshold = max(0.005, min(1.0, value))
 
-    def set_transient_ratio(self, value: float):
+    def set_transient_ratio(self, value: float) -> None:
         self.transient_ratio = max(1.5, min(20.0, value))
 
-    def set_cooldown(self, ms: int):
+    def set_cooldown(self, ms: int) -> None:
         self.cooldown_s = ms / 1000.0
 
     def get_waveform(self) -> list:
-        """Return recent normalised amplitude history for display."""
+        """Snapshot of the most recent RMS history."""
         return list(self._waveform)
 
     @staticmethod
-    def list_devices():
+    def list_devices() -> list:
+        """Available input devices as ``(index, name)`` tuples."""
         if not SD_AVAILABLE:
             return []
-        devs = []
         try:
-            for i, d in enumerate(sd.query_devices()):
-                if d["max_input_channels"] > 0:
-                    devs.append((i, d["name"]))
+            return [
+                (i, d["name"]) for i, d in enumerate(sd.query_devices())
+                if d["max_input_channels"] > 0
+            ]
         except Exception:
-            pass
-        return devs
+            return []
 
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _audio_callback(self, indata, frames, time_info, status):
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
         if not any(indata):
             return
 
         audio = indata[:, 0].astype(np.float32)
-
-        rms  = float(np.sqrt(np.mean(audio ** 2)))
+        rms = float(np.sqrt(np.mean(audio ** 2)))
         peak = float(np.max(np.abs(audio)))
 
-        # Update waveform ring buffer (downsampled to one value per chunk)
         self._waveform.append(rms)
-
-        # Update rolling baseline with slow-reacting median
         self._baseline_buf.append(rms)
         baseline = float(np.percentile(list(self._baseline_buf), 60))
 
-        self.current_level    = rms
-        self.current_peak     = peak
+        self.current_level = rms
+        self.current_peak = peak
         self.current_baseline = baseline
 
         with self._lock:
@@ -166,17 +165,19 @@ class AudioDetector:
         if paused:
             return
 
-        # Trigger condition:
-        #   1. Absolute peak exceeds threshold floor
-        #   2. Peak-to-baseline ratio exceeds transient_ratio (percussive test)
         ratio = peak / max(baseline, 1e-6)
-        if peak >= self.threshold and ratio >= self.transient_ratio:
-            now = time.time()
-            if now - self._last_trigger_time >= self.cooldown_s:
-                self._last_trigger_time = now
-                self.last_trigger_level = peak
-                if self.on_shot:
-                    try:
-                        self.on_shot(now)
-                    except Exception as e:
-                        print(f"[Audio] callback error: {e}")
+        if peak < self.threshold or ratio < self.transient_ratio:
+            return
+
+        now = time.time()
+        if now - self._last_trigger_time < self.cooldown_s:
+            return
+
+        self._last_trigger_time = now
+        self.last_trigger_level = peak
+        if self.on_shot is None:
+            return
+        try:
+            self.on_shot(now)
+        except Exception as e:
+            print(f"[Audio] callback error: {e}")

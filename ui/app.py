@@ -1,90 +1,122 @@
-"""
-ui/app.py — Splatt2 main window.
+"""Splatt2 Tkinter UI.
 
-Layout:
-  Top bar    : title, session name, Sessions history button, status
-  Left       : camera feed + camera selector + tracking quality
-  Centre     : target canvas
-  Right      : score panel OR series-complete editor (swappable)
-  Bottom     : pause / zero / decimal / mic sensitivity slider / on-target indicator
+The main window is :class:`SplattApp`. Modal dialogs and review
+windows live alongside it: :class:`MarkerSheetDialog`,
+:class:`SessionHistoryWindow`, :class:`SettingsDialog` and
+:class:`SeriesReviewWindow`.
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from __future__ import annotations
+
+import math
+import os
+import queue
+import sys
 import threading
 import time
-import queue
-import os
-import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from core.config import load_config, save_config, TARGETS, VERSION
-from core.tracker import ArucoTracker, score_shot
 from core.audio import AudioDetector
-from core.session import (Session, Shot, ShotTrace,
-                          load_session_history, reconstruct_shot_traces)
-from core.target_renderer import TargetRenderer
-from core.marker_sheet import generate_marker_sheet
+from core.config import (TARGETS, VERSION, _load_target_csv, _targets_dir,
+                          _user_targets_dir, load_all_targets, load_config,
+                          save_config)
+from core.marker_sheet import (A4_W_MM, AIMING_MARKS, _get_aiming_marks,
+                                generate_marker_sheet)
+from core.session import (APPROACH_ZONE_FACTOR, Session, Shot, ShotTrace,
+                          TracePoint, load_session_history,
+                          reconstruct_shot_traces)
 from core.smoother import make_smoother
-
-# ── Palette ───────────────────────────────────────────────────────────────────
-BG_DARK  = "#0f0f13"
-BG_MID   = "#16161d"
-BG_PANEL = "#1c1c25"
-BG_CARD  = "#22222e"
-ACCENT   = "#00e5a0"
-ACCENT2  = "#ff4f6d"
-TEXT_PRI = "#f0f0f8"
-TEXT_SEC = "#c0c0d8"
-TEXT_DIM = "#9090b0"
-BORDER   = "#2a2a3a"
-GOLD     = "#ffd060"
-
-FM = ("Consolas", 10)
-FT = ("Segoe UI", 9, "bold")
-FS = ("Consolas", 42, "bold")
-FL = ("Segoe UI", 9)
-FB = ("Segoe UI", 10)
-FH = ("Segoe UI", 11)
-
-
-def _mk_btn(parent, text, cmd, accent=False, width=None):
-    fg = BG_DARK if accent else TEXT_SEC
-    bg = ACCENT if accent else BG_CARD
-    kw = dict(bg=bg, fg=fg, activebackground=ACCENT if accent else BORDER,
-              activeforeground=fg, font=FB, relief="flat", bd=0,
-              padx=8, pady=5, cursor="hand2", text=text, command=cmd)
-    if width:
-        kw["width"] = width
-    return tk.Button(parent, **kw)
+from core.target_renderer import TargetRenderer
+from core.tracker import ArucoTracker, score_shot
+from ui.theme import (
+    ACCENT, ACCENT2, BG_CARD, BG_DARK, BG_MID, BG_PANEL, BORDER, GOLD,
+    TEXT_DIM, TEXT_PRI, TEXT_SEC,
+    FB, FH, FL, FM, FS, FT,
+    apply_theme as _apply_theme,
+    make_button as _mk_btn,
+    make_toggle_button as _mk_toggle,
+    make_chip_button as _mk_chip,
+    set_toggle_state as _set_toggle,
+    set_button_variant as _set_variant,
+)
 
 
 def _default_save_dir() -> str:
-    """sessions/ subfolder in the project root (next to main.py)."""
+    """Per-user ``sessions/`` folder, with a documents fallback on error."""
     try:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(base, "sessions")
+        from core.paths import sessions_dir
+        return str(sessions_dir())
     except Exception:
         return os.path.join(os.path.expanduser("~"), "Documents", "Splatt2")
+
+
+_ROTATION_FLAGS = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def _camera_backend() -> int:
+    """OpenCV capture backend appropriate for the current platform.
+
+    Hardcoding ``CAP_DSHOW`` (DirectShow, Windows-only) on macOS or
+    Linux causes ``cv2.VideoCapture`` to hang or block while OpenCV
+    walks through fallbacks, which freezes the UI thread.
+    """
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform.startswith("linux"):
+        return cv2.CAP_V4L2
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
+class _FpsCounter:
+    """Rolling FPS counter that updates twice per second."""
+
+    def __init__(self, window_s: float = 0.5):
+        self._window = window_s
+        self._frames = 0
+        self._last = time.time()
+        self.value = 0.0
+
+    def tick(self) -> float:
+        self._frames += 1
+        now = time.time()
+        elapsed = now - self._last
+        if elapsed >= self._window:
+            self.value = self._frames / elapsed
+            self._frames = 0
+            self._last = now
+        return self.value
+
+
+def _compute_scoring_radius_mm(target_cfg: dict, cfg: dict) -> float:
+    """Single source of truth for the scoring radius (R = card_r + pellet_r)."""
+    card_r = target_cfg["diameter_mm"] / 2.0
+    calibre = float(cfg.get("scoring_calibre_mm",
+                            target_cfg.get("calibre_mm", 4.5)))
+    return card_r + calibre / 2.0
 
 
 class SplattApp:
     def __init__(self):
         self.cfg, self._first_run = load_config()
         self.target_cfg = TARGETS[self.cfg["target_key"]]
-        _card_r   = self.target_cfg["diameter_mm"] / 2.0
-        _calibre  = float(self.cfg.get("scoring_calibre_mm",
-                          self.target_cfg.get("calibre_mm", 4.5)))
-        _R        = _card_r + _calibre / 2.0
         self.session = Session(
             name=self.cfg["session_name"],
             shots_per_series=self.cfg["shots_per_series"],
-            scoring_radius_mm=_R,
+            scoring_radius_mm=_compute_scoring_radius_mm(
+                self.target_cfg, self.cfg),
         )
-        self._apply_session_cfg()  # wire cfg into session at startup
+        self._apply_session_cfg()
         self.tracker = ArucoTracker(
             aruco_dict_name=self.cfg.get("aruco_dict", "DICT_4X4_50"),
             marker_size_mm=float(self.cfg.get("aruco_marker_mm", 40.0)),
@@ -93,28 +125,41 @@ class SplattApp:
             clahe_clip=float(self.cfg.get("clahe_clip", 4.0)),
             marker_count=int(self.cfg.get("aruco_marker_count", 4)),
             brightness_target=float(self.cfg.get("brightness_target", 128.0)),
+            sharpen=float(self.cfg.get("sharpen", 0.0)),
         )
         self.target_renderer = None
 
+        # ~12 ms chunks keep latency low while still capturing the click.
         self.audio = AudioDetector(
             threshold=self.cfg.get("audio_trigger_threshold", 0.15),
             transient_ratio=self.cfg.get("audio_transient_ratio", 6.0),
             cooldown_ms=self.cfg.get("audio_trigger_cooldown_ms", 800),
             sample_rate=self.cfg.get("audio_sample_rate", 44100),
-            chunk_size=512,          # ~12ms chunks — low latency, still enough for transient detection
+            chunk_size=512,
             device_index=self.cfg.get("audio_device_index"),
             on_shot=self._on_shot_detected,
         )
 
-        # State
+        # Camera and tracking state.
         self._cap = None
         self._running = False
         self._paused = False
+        # Set whenever no camera loop is running. The loop clears it
+        # while alive and sets it again on exit, after releasing the
+        # capture device. Re-opens block on this event so the new
+        # session never races the previous one's teardown.
+        self._loop_done = threading.Event()
+        self._loop_done.set()
+        # Coalescing flag: the camera worker sets this to request a UI
+        # repaint, the Tk thread clears it once it has rendered. This
+        # avoids piling up per-frame ``root.after`` calls when the UI
+        # cannot keep pace with capture.
+        self._cam_refresh_pending = False
         self._shot_queue = queue.Queue()
-        self._current_aim_mm  = None
-        self._raw_aim_prev     = None   # previous raw position (pre-smoother)
-        self._raw_aim_prev2    = None   # two frames ago (for velocity reversal)
-        self._spike_hold       = None   # buffered position during spike candidate
+        self._current_aim_mm = None
+        self._raw_aim_prev = None
+        self._raw_aim_prev2 = None
+        self._spike_hold = None
         self._tracking_quality = 0.0
         self._zero_offset = (
             float(self.cfg.get("zero_offset_x", 0.0)),
@@ -122,65 +167,78 @@ class SplattApp:
         )
         self._zero_mode = False
         self._decimal_scoring = self.cfg.get("decimal_scoring", False)
-        self._zoom_factor      = 1.0   # target canvas zoom (0.3–1.5)
-        self._live_fps         = 0.0   # measured camera FPS
-        self._sharpness        = 0.0   # Laplacian variance (focus measure)
-        self._sharpness_peak   = 0.0   # peak hold
-        self._sharpness_peak_t = 0.0   # time of peak
+        self._zoom_factor = 1.0
+        # Digital zoom on the captured frame: crops the centre of each
+        # frame before detection so distant marker sheets get more
+        # pixels per marker. 1.0 means no crop.
+        self._cam_zoom = float(self.cfg.get("camera_zoom", 1.0))
+        # Diagnostic mode: when on, the camera preview shows the
+        # greyscale frame the ArUco detector actually sees (after
+        # gain, CLAHE and sharpen) instead of the raw BGR feed.
+        self._show_processed = False
+        self._live_fps = 0.0
+        self._sharpness = 0.0
+        self._sharpness_peak = 0.0
+        self._sharpness_peak_t = 0.0
+
+        # Display toggles.
         self._show_acp = True
         self._show_bbox_shots = False
         self._show_bbox_acp = False
-        self._show_group = False    # show group circle (blue) and MPI cross
+        self._show_group = False
+        self._shot_dot_only = False
         self._highlighted_trace: ShotTrace = None
         self._on_target_status = False
         self._in_approach_zone = False
+
+        # Series and shot state.
         self._series_started = False
-        self._post_shot_cooldown_s = float(self.cfg.get("post_shot_cooldown_s", 2.0))
+        self._post_shot_cooldown_s = float(
+            self.cfg.get("post_shot_cooldown_s", 2.0))
         self._last_shot_fired_time: float = 0.0
         self._last_shot_info = None
-        self._current_markers_found: int = 0   # updated every camera frame
+        self._current_markers_found: int = 0
         self._camera_rotation = int(self.cfg.get("camera_rotation", 0))
-        self._fine_zero_mode = False   # click-on-canvas zero fine-tune
-        self._shot_dot_only = False       # True=dot, False=full circle
+        self._fine_zero_mode = False
         self._smoother = make_smoother(
             self.cfg.get("smooth_mode", "ema"),
             alpha=self.cfg.get("smooth_alpha", 0.35),
             window=self.cfg.get("smooth_window", 11),
             poly=self.cfg.get("smooth_poly", 2),
         )
-        self._selected_shot: Shot = None   # for shot log selection
+        self._selected_shot: Shot = None
         self._latest_cam_frame = None
 
-        # Series editor state
+        # Series editor state. ``BooleanVar``s need a root, so they're
+        # bound after ``_build_window`` runs.
         self._in_series_editor = False
-        self._editor_shot_vars = {}      # shot.index -> BooleanVar
-        # BooleanVars must be created AFTER the root window exists
+        self._editor_shot_vars = {}
         self._editor_show_trace = None
-        self._editor_show_acp   = None
-        self._editor_show_dur   = None
+        self._editor_show_acp = None
+        self._editor_show_dur = None
 
-        self._build_window()   # creates self.root
-        # Start update loop — runs always, not just when camera active
-        self.root.after(100, self._update_loop)
-        # First-run wizard — shown after window is ready
+        self._build_window()
+        # Score, target trace and audio refreshes run on a slow timer
+        # so the UI thread is mostly idle and stays responsive to
+        # native events like dropdown clicks. Camera frame display is
+        # driven directly from the worker via ``_request_cam_refresh``.
+        self.root.after(100, self._tick_periodic)
         if self._first_run:
             self.root.after(300, self._show_first_run_wizard)
-        # Now safe to create tk variables
         self._editor_show_trace = tk.BooleanVar(value=True)
-        self._editor_show_acp   = tk.BooleanVar(value=True)
-        self._editor_show_dur   = tk.BooleanVar(value=True)
-        self._apply_styles()
-
-    # =========================================================================
-    # WINDOW BUILD
-    # =========================================================================
-
+        self._editor_show_acp = tk.BooleanVar(value=True)
+        self._editor_show_dur = tk.BooleanVar(value=True)
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title(f"SPLATT2 v{VERSION} — Target Shooting Trainer")
         self.root.configure(bg=BG_DARK)
         self.root.minsize(1200, 750)
         self.root.geometry("1440x840")
+
+        # Theme must be applied before any widgets are created so the
+        # option database affects them. ttk.Style settings are applied
+        # to the root and inherited by widgets in any toplevel.
+        self._apply_styles()
 
         # Top bar
         top = tk.Frame(self.root, bg=BG_MID, height=46)
@@ -197,8 +255,6 @@ class SplattApp:
         self._tracking_lbl = tk.Label(top, text="TRACKING: —", bg=BG_MID,
                                       fg=TEXT_DIM, font=("Consolas", 9))
         self._tracking_lbl.pack(side="right", padx=8)
-        _mk_btn(top, "📋  Series", self._open_series_tab).pack(
-            side="right", padx=4, pady=8)
 
         # Body
         body = tk.Frame(self.root, bg=BG_DARK)
@@ -231,8 +287,6 @@ class SplattApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<KeyPress>", self._on_key)
-
-    # ── Camera panel ──────────────────────────────────────────────────────────
     def _build_camera_panel(self, parent):
         tk.Label(parent, text="CAMERA FEED", bg=BG_PANEL, fg=TEXT_DIM,
                  font=FL).pack(anchor="nw", padx=8, pady=(6, 0))
@@ -245,11 +299,14 @@ class SplattApp:
         self._focus_active = False
         ff_btn = tk.Frame(parent, bg=BG_PANEL)
         ff_btn.pack(fill="x", padx=6, pady=(0, 2))
-        self._btn_focus = tk.Button(ff_btn, text="◎ Focus assist: OFF",
-                                     command=self._toggle_focus_assist,
-                                     bg=BG_CARD, fg=TEXT_DIM, font=FL,
-                                     relief="flat", padx=6, pady=2, cursor="hand2")
+        self._btn_focus = _mk_toggle(ff_btn, "◎ Focus assist: OFF",
+                                     self._focus_active,
+                                     self._toggle_focus_assist)
         self._btn_focus.pack(side="left")
+        self._btn_processed = _mk_toggle(
+            ff_btn, "◧ Tracker view",
+            self._show_processed, self._toggle_processed_view)
+        self._btn_processed.pack(side="left", padx=(4, 0))
 
         self._focus_frame = tk.Frame(parent, bg=BG_PANEL)
         # Not packed yet — shown only when active
@@ -271,6 +328,22 @@ class SplattApp:
         ttk.Progressbar(qf, variable=self._quality_var, maximum=100, length=160,
                         style="Quality.Horizontal.TProgressbar").pack(side="left", padx=4)
 
+        # Camera digital zoom (centre crop). Useful when the target
+        # sheet is far from the camera and markers are too small for
+        # ArUco to detect reliably.
+        zf = tk.Frame(parent, bg=BG_PANEL)
+        zf.pack(fill="x", padx=6, pady=(0, 2))
+        tk.Label(zf, text="ZOOM", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=FL).pack(side="left")
+        self._cam_zoom_var = tk.DoubleVar(value=self._cam_zoom)
+        ttk.Scale(zf, from_=1.0, to=8.0, variable=self._cam_zoom_var,
+                  orient="horizontal", length=140,
+                  command=self._on_cam_zoom_change).pack(side="left", padx=4)
+        self._cam_zoom_lbl = tk.Label(
+            zf, text=f"{self._cam_zoom:.1f}×", bg=BG_PANEL, fg=ACCENT,
+            font=("Consolas", 9), width=5)
+        self._cam_zoom_lbl.pack(side="left")
+
         # Camera selector
         sf = tk.Frame(parent, bg=BG_PANEL)
         sf.pack(fill="x", padx=6, pady=(0, 2))
@@ -290,8 +363,6 @@ class SplattApp:
         self._btn_cam.pack(side="left")
         _mk_btn(cf, "⚙  Settings", self._open_settings).pack(side="right")
         _mk_btn(cf, "🎛  Cam Props", self._open_camera_properties).pack(side="right", padx=4)
-
-    # ── Target panel ──────────────────────────────────────────────────────────
     def _build_target_panel(self, parent):
         tk.Label(parent, text="TARGET", bg=BG_PANEL, fg=TEXT_DIM,
                  font=FL).pack(anchor="nw", padx=8, pady=(6, 0))
@@ -312,8 +383,6 @@ class SplattApp:
         self._aim_lbl = tk.Label(info, text="Aim: — mm",
                                  bg=BG_PANEL, fg=TEXT_DIM, font=FM)
         self._aim_lbl.pack(side="right")
-
-    # ── Score panel ───────────────────────────────────────────────────────────
     def _build_score_panel(self, parent):
         # Score card
         sc = tk.Frame(parent, bg=BG_CARD)
@@ -366,55 +435,68 @@ class SplattApp:
             v.pack(side="right")
             self._stat_labels[key] = v
 
-        # Display toggles — two rows so nothing overflows 270px panel
-        def _tog_state(text_on, text_off, state):
-            return (text_on if state else text_off,
-                    ACCENT if state else BG_CARD,
-                    BG_DARK if state else TEXT_SEC)
-
-        def _tbtn(parent, text_on, text_off, state, cmd):
-            t, bg, fg = _tog_state(text_on, text_off, state)
-            return tk.Button(parent, text=t, bg=bg, fg=fg, font=FL,
-                             relief="flat", bd=0, padx=6, pady=4,
-                             cursor="hand2", command=cmd,
-                             activebackground=ACCENT, activeforeground=BG_DARK)
+        # Display toggles — two rows so nothing overflows 270px panel.
+        # Toggles use a clearly-distinct active style so it's obvious
+        # whether each overlay is on.
+        BLUE = "#4f8fff"
 
         # Row 1: ACP  Shots Box  ACP Box
         row1 = tk.Frame(parent, bg=BG_PANEL)
         row1.pack(fill="x", padx=6, pady=(2, 1))
-        self._btn_acp = _tbtn(row1, "◈ ACP", "◈ ACP",
-                               self._show_acp, self._toggle_acp)
-        self._btn_acp.config(bg=ACCENT if self._show_acp else BG_CARD,
-                              fg=BG_DARK if self._show_acp else TEXT_SEC)
+        self._btn_acp = _mk_toggle(row1, "◈ ACP", self._show_acp,
+                                   self._toggle_acp)
         self._btn_acp.pack(side="left", padx=(0, 2))
-        self._btn_bbox_s = _tbtn(row1, "⊡ Shots", "⊡ Shots",
-                                  self._show_bbox_shots, self._toggle_bbox_shots)
-        if self._show_bbox_shots:
-            self._btn_bbox_s.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_bbox_s = _mk_toggle(row1, "⊡ Shots", self._show_bbox_shots,
+                                      self._toggle_bbox_shots,
+                                      accent_color=BLUE)
         self._btn_bbox_s.pack(side="left", padx=(0, 2))
-        self._btn_bbox_a = _tbtn(row1, "◇ ACP Box", "◇ ACP Box",
-                                  self._show_bbox_acp, self._toggle_bbox_acp)
-        if self._show_bbox_acp:
-            self._btn_bbox_a.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_bbox_a = _mk_toggle(row1, "◇ ACP Box", self._show_bbox_acp,
+                                      self._toggle_bbox_acp,
+                                      accent_color=BLUE)
         self._btn_bbox_a.pack(side="left")
 
         # Row 2: Dot  Group circle
         row2 = tk.Frame(parent, bg=BG_PANEL)
         row2.pack(fill="x", padx=6, pady=(0, 3))
-        self._btn_dot = _tbtn(row2, "● Dot", "● Dot",
-                               self._shot_dot_only, self._toggle_dot_mode)
-        if self._shot_dot_only:
-            self._btn_dot.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_dot = _mk_toggle(row2, "● Dot", self._shot_dot_only,
+                                   self._toggle_dot_mode)
         self._btn_dot.pack(side="left", padx=(0, 2))
-        self._btn_group = _tbtn(row2, "○ Group", "○ Group",
-                                 self._show_group, self._toggle_group)
-        if self._show_group:
-            self._btn_group.config(bg=ACCENT, fg=BG_DARK)
+        self._btn_group = _mk_toggle(row2, "○ Group", self._show_group,
+                                     self._toggle_group,
+                                     accent_color=GOLD)
         self._btn_group.pack(side="left")
 
-        # Shot log
-        lc = tk.Frame(parent, bg=BG_CARD)
+        # Remember each toggle's accent so updates use the same colour.
+        self._toggle_accents = {
+            id(self._btn_acp): ACCENT,
+            id(self._btn_bbox_s): BLUE,
+            id(self._btn_bbox_a): BLUE,
+            id(self._btn_dot): ACCENT,
+            id(self._btn_group): GOLD,
+        }
+
+        # Action buttons must be packed before the shot log so the
+        # ``side="bottom"`` slice is reserved first; otherwise the
+        # ``expand=True`` shot log claims all remaining space and the
+        # buttons are pushed below the visible area.
+        bf = tk.Frame(parent, bg=BG_PANEL)
+        bf.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        _mk_btn(bf, "⟲  Undo Shot",    self._undo_shot).pack(fill="x", pady=1)
+        self._btn_start_series = _mk_btn(bf, "▶  Start Series",
+                                              self._start_series, accent=True)
+        self._btn_start_series.pack(fill="x", pady=1)
+        _mk_btn(bf, "📋  Series Review", self._open_series_tab).pack(fill="x", pady=1)
+        _mk_btn(bf, "◻  Reset All",    self._reset_all).pack(fill="x", pady=1)
+        tk.Frame(bf, bg=BG_PANEL, height=3).pack()
+        _mk_btn(bf, "⊞  Marker Sheet", self._print_markers).pack(fill="x", pady=1)
+        _mk_btn(bf, "💾  Save CSV",     self._save_csv).pack(fill="x", pady=1)
+
+        # Shot log. Sized to a fixed minimum height so it stays visible
+        # even when the right column is short; the inner Text widget
+        # then expands into any remaining vertical space.
+        lc = tk.Frame(parent, bg=BG_CARD, height=180)
         lc.pack(fill="both", expand=True, padx=6, pady=(0, 3))
+        lc.pack_propagate(False)
         hdr = tk.Frame(lc, bg=BG_CARD)
         hdr.pack(fill="x", padx=8, pady=(6, 2))
         tk.Label(hdr, text="SHOT LOG", bg=BG_CARD, fg=TEXT_DIM, font=FL).pack(side="left")
@@ -437,40 +519,28 @@ class SplattApp:
                          ("hdr", TEXT_DIM),("sel", ACCENT)]:
             self._shot_log.tag_config(tag, foreground=col)
         self._shot_log.tag_config("sel_bg", background=BG_CARD)
-
-        # Action buttons
-        bf = tk.Frame(parent, bg=BG_PANEL)
-        bf.pack(fill="x", padx=6, pady=(0, 4))
-        _mk_btn(bf, "⟲  Undo Shot",    self._undo_shot).pack(fill="x", pady=1)
-        self._btn_start_series = _mk_btn(bf, "▶  Start Series",
-                                              self._start_series, accent=True)
-        self._btn_start_series.pack(fill="x", pady=1)
-        _mk_btn(bf, "📋  Series Review", self._open_series_tab).pack(fill="x", pady=1)
-        _mk_btn(bf, "◻  Reset All",    self._reset_all).pack(fill="x", pady=1)
-        tk.Frame(bf, bg=BG_PANEL, height=3).pack()
-        _mk_btn(bf, "⊞  Marker Sheet", self._print_markers).pack(fill="x", pady=1)
-        _mk_btn(bf, "💾  Save CSV",     self._save_csv).pack(fill="x", pady=1)
-
-    # ── Bottom bar ────────────────────────────────────────────────────────────
     def _build_bottom_bar(self, parent):
         _mk_btn(parent, "❙❙  Pause", self._toggle_pause).pack(
             side="left", padx=(8, 3), pady=5)
         self._btn_pause = parent.winfo_children()[-1]
 
-        self._btn_zero = _mk_btn(parent, "◎  Zero", self._toggle_zero_mode)
+        self._btn_zero = _mk_toggle(parent, "◎  Zero", False,
+                                    self._toggle_zero_mode,
+                                    accent_color=GOLD)
         self._btn_zero.pack(side="left", padx=(0, 2), pady=5)
-        self._btn_fine_zero = _mk_btn(parent, "⊕  Fine Zero",
-                                       self._toggle_fine_zero_mode)
+        self._btn_fine_zero = _mk_toggle(parent, "⊕  Fine Zero", False,
+                                         self._toggle_fine_zero_mode,
+                                         accent_color=GOLD)
         self._btn_fine_zero.pack(side="left", padx=(0, 3), pady=5)
 
-        self._btn_decimal = _mk_btn(
+        self._btn_decimal = _mk_toggle(
             parent, "DEC ON" if self._decimal_scoring else "DEC OFF",
-            self._toggle_decimal_scoring)
+            self._decimal_scoring, self._toggle_decimal_scoring)
         self._btn_decimal.pack(side="left", padx=(0, 8), pady=5)
 
         rot = self.cfg.get("camera_rotation", 0)
-        self._btn_rotate = _mk_btn(
-            parent, f"↻ {rot}°", self._cycle_rotation)
+        self._btn_rotate = _mk_toggle(
+            parent, f"↻ {rot}°", rot != 0, self._cycle_rotation)
         self._btn_rotate.pack(side="left", padx=(0, 8), pady=5)
 
         # Zoom slider
@@ -530,53 +600,78 @@ class SplattApp:
                  bg=BG_MID, fg=TEXT_DIM, font=FL).pack(side="right", padx=10)
 
     def _apply_styles(self):
-        s = ttk.Style()
-        s.theme_use("clam")
-        for name, col in [("Quality", ACCENT), ("Audio", "#4f8fff")]:
-            s.configure(f"{name}.Horizontal.TProgressbar",
-                        troughcolor=BG_DARK, background=col,
-                        bordercolor=BG_DARK, lightcolor=col, darkcolor=col)
-        s.configure("TScale", background=BG_MID, troughcolor=BG_CARD)
-        s.configure("TNotebook", background=BG_DARK, borderwidth=0)
-        s.configure("TNotebook.Tab", background=BG_CARD, foreground=TEXT_SEC,
-                    padding=[8, 3])
-        s.map("TNotebook.Tab", background=[("selected", BG_PANEL)],
-              foreground=[("selected", ACCENT)])
-
-    # =========================================================================
-    # CAMERA
-    # =========================================================================
-
+        """Apply the dark ttk + tk option-database theme to the root."""
+        _apply_theme(self.root)
     def _scan_cameras(self):
+        """Probe available cameras off the UI thread.
+
+        On macOS each ``VideoCapture(idx, AVFOUNDATION)`` can block for
+        a second or more (permissions, device enumeration), so doing
+        this on the Tk thread freezes the entire app. The scan runs in
+        a daemon thread and posts results back via ``root.after``.
+        """
         self._cam_combo.config(state="disabled")
         self._cam_combo["values"] = ["Scanning..."]
         self._cam_var.set("Scanning...")
-        self.root.after(10, self._do_scan)
+        threading.Thread(target=self._scan_in_background,
+                         daemon=True).start()
 
-    def _do_scan(self):
+    def _scan_in_background(self) -> None:
+        """Probe camera indices until a gap suggests we're past the last one.
+
+        macOS exposes a dense index range, so two consecutive failures
+        is a reliable stop signal that avoids the noisy AVFoundation
+        "out of bounds" warnings. On Windows/Linux indices can be
+        sparse, so we still probe up to 8.
+        """
+        max_indices = 8
+        max_consecutive_misses = 8 if sys.platform != "darwin" else 2
+
         found = []
-        for i in range(8):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                found.append((i, f"{i}: Camera {i}  ({w}x{h})"))
-                cap.release()
-            else:
-                cap.release()
+        misses = 0
+        for i in range(max_indices):
+            size = self._probe_camera(i)
+            if size is None:
+                misses += 1
+                if misses >= max_consecutive_misses:
+                    break
+                continue
+            misses = 0
+            w, h = size
+            found.append((i, f"{i}: Camera {i}  ({w}x{h})"))
+
         if not found:
             found = [(i, f"{i}: Camera {i}") for i in range(4)]
-        self._cam_entries = {lbl: idx for idx, lbl in found}
-        labels = [lbl for _, lbl in found]
+        self.root.after(0, self._apply_scan_results, found)
+
+    def _apply_scan_results(self, found: list) -> None:
+        self._cam_entries = {label: idx for idx, label in found}
+        labels = [label for _, label in found]
         self._cam_combo["values"] = labels
         self._cam_combo.config(state="readonly")
-        cur = self.cfg.get("camera_index", 0)
-        for lbl in labels:
-            if lbl.startswith(str(cur) + ":"):
-                self._cam_var.set(lbl)
-                return
-        if labels:
+
+        current = self.cfg.get("camera_index", 0)
+        prefix = f"{current}:"
+        match = next((label for label in labels
+                      if label.startswith(prefix)), None)
+        if match is not None:
+            self._cam_var.set(match)
+        elif labels:
             self._cam_var.set(labels[0])
+
+    @staticmethod
+    def _probe_camera(idx: int):
+        """Return ``(width, height)`` for the camera at ``idx`` if openable."""
+        cap = cv2.VideoCapture(idx, _camera_backend())
+        try:
+            if not cap.isOpened():
+                return None
+            return (
+                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            )
+        finally:
+            cap.release()
 
     def _on_cam_selected(self, event=None):
         lbl = self._cam_var.get()
@@ -585,213 +680,316 @@ class SplattApp:
             save_config(self.cfg)
             if self._running:
                 self._stop_camera()
-                self.root.after(400, self._start_camera)
+                # The next _start_camera call waits on _loop_done in
+                # its background open thread, so no manual delay is
+                # needed.
+                self._start_camera()
 
     def _start_camera(self):
+        """Stop if running; otherwise open the camera off the UI thread.
+
+        Opening a ``VideoCapture`` on macOS can stall the calling
+        thread for over a second while AVFoundation negotiates with
+        the device. Doing it on the Tk thread freezes the entire UI,
+        so we kick the open into a worker and finish setup on the main
+        thread once the capture handle is ready.
+        """
         if self._running:
             self._stop_camera()
             return
+
+        self._set_status("Opening camera…", GOLD)
+        self._btn_cam.configure(state="disabled")
         idx = self.cfg.get("camera_index", 0)
-        self._cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not self._cap.isOpened():
-            self._cap = cv2.VideoCapture(idx)
-        if not self._cap.isOpened():
-            messagebox.showerror("Camera Error",
-                                  f"Cannot open camera {idx}. Try another index.")
+        threading.Thread(target=self._open_camera_in_background,
+                         args=(idx,), daemon=True).start()
+
+    def _open_camera_in_background(self, idx) -> None:
+        # Wait for any previous camera loop to fully tear down its
+        # device handle before grabbing the next one. Without this,
+        # AVFoundation can hand us a half-released handle that hangs.
+        self._loop_done.wait(timeout=5.0)
+        cap = self._open_capture(idx)
+        self.root.after(0, self._finish_camera_open, idx, cap)
+
+    def _finish_camera_open(self, idx, cap) -> None:
+        self._btn_cam.configure(state="normal")
+        if cap is None:
+            self._set_status("READY", TEXT_SEC)
+            messagebox.showerror(
+                "Camera Error",
+                f"Cannot open camera {idx}. Try another index.")
             return
-        w = int(self.cfg.get("video_width", 640))
-        h = int(self.cfg.get("video_height", 480))
+
         target_fps = int(self.cfg.get("video_fps", 30))
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        self._cap.set(cv2.CAP_PROP_FPS, target_fps)
-        # Pixel format — MJPEG prevents static-scene frame rate throttling
-        _fmt = self.cfg.get("camera_pixel_format", "Auto")
-        if _fmt == "MJPEG":
-            _accepted = self._cap.set(cv2.CAP_PROP_FOURCC,
-                                      cv2.VideoWriter.fourcc('M','J','P','G'))
-            _rb = int(self._cap.get(cv2.CAP_PROP_FOURCC))
-            _rb_str = ''.join([chr((_rb >> (8*i)) & 0xFF) for i in range(4)])
-            print(f"[Camera] MJPEG requested — fourcc readback: {_rb_str!r}")
-        elif _fmt == "YUY2":
-            self._cap.set(cv2.CAP_PROP_FOURCC,
-                          cv2.VideoWriter.fourcc('Y','U','Y','2'))
-        # Minimise buffer — always get freshest frame, never queue up stale ones
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        self._configure_capture(cap, target_fps)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
         self._camera_fps = actual_fps if actual_fps > 0 else target_fps
+
+        self._cap = cap
         self._running = True
-        self._btn_cam.config(text="■  Stop Camera", bg=ACCENT2, fg=BG_DARK)
+        self._loop_done.clear()
+        self._btn_cam.configure(text="■  Stop Camera")
+        _set_variant(self._btn_cam, "danger")
         self._set_status("LIVE", ACCENT)
         self.audio.start()
-        threading.Thread(target=self._camera_loop, daemon=True).start()
-        # _update_loop is already running (started at init); no need to restart
+        threading.Thread(target=self._camera_loop,
+                         args=(cap,), daemon=True).start()
+
+    @staticmethod
+    def _open_capture(idx: int):
+        """Open the camera using the OS-appropriate backend.
+
+        Falls back to ``CAP_ANY`` so an unusual driver setup still
+        works, but the platform-specific backend is tried first to
+        avoid OpenCV's slow probe of unsupported backends.
+        """
+        cap = cv2.VideoCapture(idx, _camera_backend())
+        if cap.isOpened():
+            return cap
+        cap = cv2.VideoCapture(idx)
+        return cap if cap.isOpened() else None
+
+    def _configure_capture(self, cap, target_fps: int) -> None:
+        """Apply resolution, FPS, pixel format and buffer settings."""
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.cfg.get("video_width", 640)))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.cfg.get("video_height", 480)))
+        cap.set(cv2.CAP_PROP_FPS, target_fps)
+        self._apply_pixel_format(cap)
+        # BUFFERSIZE=1 ensures cap.read() always returns the freshest frame
+        # rather than queueing up stale ones.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    def _apply_pixel_format(self, cap) -> None:
+        """Optionally request MJPEG/YUY2 to avoid static-scene FPS throttling."""
+        fmt = self.cfg.get("camera_pixel_format", "Auto")
+        if fmt == "MJPEG":
+            cap.set(cv2.CAP_PROP_FOURCC,
+                    cv2.VideoWriter.fourcc("M", "J", "P", "G"))
+            readback = int(cap.get(cv2.CAP_PROP_FOURCC))
+            chars = "".join(chr((readback >> (8 * i)) & 0xFF) for i in range(4))
+            print(f"[Camera] MJPEG requested — fourcc readback: {chars!r}")
+        elif fmt == "YUY2":
+            cap.set(cv2.CAP_PROP_FOURCC,
+                    cv2.VideoWriter.fourcc("Y", "U", "Y", "2"))
 
     def _stop_camera(self):
+        """Signal the camera loop to exit; the loop releases the cap.
+
+        Releasing the capture from the UI thread while the loop thread
+        is mid-``cap.read()`` deadlocks AVFoundation on macOS. The loop
+        owns the device handle for its lifetime and tears it down on
+        exit.
+        """
         self._running = False
         self.audio.stop()
-        if self._cap:
-            self._cap.release()
-            self._cap = None
-        self._btn_cam.config(text="▶  Start Camera", bg=BG_CARD, fg=TEXT_SEC)
+        self._btn_cam.configure(text="▶  Start Camera")
+        _set_variant(self._btn_cam, "accent")
         self._set_status("STOPPED", TEXT_DIM)
 
 
 
-    def _camera_loop(self):
-        """
-        Optimised camera loop:
+    def _camera_loop(self, cap):
+        """Drive frame capture, ArUco detection and UI publishing.
+
+        The loop owns ``cap`` for its entire lifetime: the UI thread
+        signals exit via ``self._running``, and the loop releases the
+        device on the way out before setting ``self._loop_done``. This
+        keeps device teardown on the same thread that reads from it,
+        avoiding the macOS deadlock where ``cap.release()`` from the
+        UI thread blocks while the loop is mid-``cap.read()``.
+
         - BUFFERSIZE=1 means cap.read() always returns the freshest frame
-        - Frame is downscaled to max 480p for ArUco detection regardless of
-          capture resolution — this is the single biggest speed gain
+        - Frame is downscaled to a configurable cap for ArUco detection
+          (default 640x480). At long range this can be raised so markers
+          keep enough pixels per side to be detected reliably.
         - UI preview is only updated every N frames to save tkinter overhead
         - 'no_video_mode': skip annotated frame entirely, pure tracking only
         """
-        no_video   = self.cfg.get("no_video_mode", False)
-        ui_every   = 3        # send frame to UI every 3rd detection
+        no_video = self.cfg.get("no_video_mode", False)
+        ui_every = 3
         ui_counter = 0
-        detect_w   = 640      # ArUco detection width (never larger than capture)
-        detect_h   = 480
+        detect_w = int(self.cfg.get("detection_max_width", 640))
+        detect_h = int(self.cfg.get("detection_max_height", 480))
+        fps = _FpsCounter()
 
-        # Live FPS measurement
-        _fps_frame_count = 0
-        _fps_last_time   = time.time()
-        _fps_display     = 0.0
+        try:
+            while self._running:
+                if not cap.isOpened():
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.005)
+                    continue
 
-        while self._running:
-            if not self._cap or not self._cap.isOpened():
-                break
-            ret, frame = self._cap.read()
-            if not ret:
-                time.sleep(0.005)
-                continue
+                if self.cfg.get("flip_image"):
+                    frame = cv2.flip(frame, self.cfg.get("flip_mode", -1))
+                rotation = _ROTATION_FLAGS.get(self._camera_rotation)
+                if rotation is not None:
+                    frame = cv2.rotate(frame, rotation)
+                if self._cam_zoom > 1.001:
+                    frame = self._apply_camera_zoom(frame, self._cam_zoom)
 
+                small = self._downscale_for_detection(frame, detect_w, detect_h)
+                if self._focus_active:
+                    self._sharpness = self._measure_sharpness(small)
 
-            if self.cfg.get("flip_image"):
-                frame = cv2.flip(frame, self.cfg.get("flip_mode", -1))
+                result = self.tracker.process_frame(small)
+                self._tracking_quality = result.quality
+                self._current_markers_found = result.markers_found
 
-            # Camera rotation (0 / 90 / 180 / 270 degrees)
-            rot = self._camera_rotation
-            if rot == 90:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            elif rot == 180:
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
-            elif rot == 270:
-                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                if result.aim_mm is not None and not self._paused:
+                    self._consume_aim(result)
 
-            # Downscale for detection — major speed improvement
-            fh, fw = frame.shape[:2]
-            if fw > detect_w or fh > detect_h:
-                scale = min(detect_w / fw, detect_h / fh)
-                small = cv2.resize(frame,
-                                   (int(fw * scale), int(fh * scale)),
-                                   interpolation=cv2.INTER_LINEAR)
-            else:
-                small = frame
+                self._live_fps = fps.tick()
+                if self._focus_active:
+                    self._update_sharpness_peak()
 
-            # Laplacian variance — only computed when focus assist is on
-            if self._focus_active:
-                _lap = cv2.Laplacian(small if len(small.shape)==2
-                                     else cv2.cvtColor(small, cv2.COLOR_BGR2GRAY),
-                                     cv2.CV_64F)
-                self._sharpness = float(_lap.var())
-
-            result = self.tracker.process_frame(small)
-            self._tracking_quality = result.quality
-            self._current_markers_found = result.markers_found
-
-            if result.aim_mm is not None and not self._paused:
-                raw = result.aim_mm
-                zeroed = (raw[0] - self._zero_offset[0],
-                          raw[1] - self._zero_offset[1])
-                if result.quality >= 0.25:
-                    # ── Velocity spike filter (raw positions, pre-smoother) ──
-                    # Detects bad homography spikes: a large jump that immediately
-                    # reverses. Genuine fast movement (recoil, swing) continues
-                    # in the same direction — it does not sharply reverse.
-                    filtered = zeroed
-                    if self._raw_aim_prev is not None:
-                        import math as _m
-                        spk_vel  = float(self.cfg.get("spike_velocity_mm", 25.0))
-                        spk_rev  = float(self.cfg.get("spike_reversal", 0.7))
-                        px, py   = self._raw_aim_prev
-                        vx = zeroed[0] - px
-                        vy = zeroed[1] - py
-                        speed = _m.sqrt(vx*vx + vy*vy)
-                        if speed > spk_vel and self._raw_aim_prev2 is not None:
-                            # Check if previous frame also had a large jump
-                            # and this frame reverses it
-                            p2x, p2y = self._raw_aim_prev2
-                            v2x = px - p2x
-                            v2y = py - p2y
-                            dot = vx*v2x + vy*v2y
-                            mag2 = _m.sqrt(v2x*v2x + v2y*v2y)
-                            if mag2 > spk_vel and dot < -spk_rev * speed * mag2:
-                                # Sharp reversal detected — this frame is the
-                                # return from a spike. Discard both spike frames.
-                                filtered = self._raw_aim_prev2
-                                self._raw_aim_prev  = self._raw_aim_prev2
-                    self._raw_aim_prev2 = self._raw_aim_prev
-                    self._raw_aim_prev  = zeroed
-                    smoothed = self._smoother.update(filtered)
-                    self._current_aim_mm = smoothed
-                    in_appr, on_tgt = self.session.update_aim(smoothed)
-                    self._in_approach_zone = in_appr
-                    self._on_target_status = on_tgt
-
-            # Measure actual delivered FPS
-            _fps_frame_count += 1
-            _fps_now = time.time()
-            _fps_elapsed = _fps_now - _fps_last_time
-            if _fps_elapsed >= 0.5:   # update every half second
-                _fps_display     = _fps_frame_count / _fps_elapsed
-                _fps_frame_count = 0
-                _fps_last_time   = _fps_now
-            self._live_fps = _fps_display
-            # Update sharpness peak hold (only when focus assist is on)
-            if self._focus_active:
-                _now = time.time()
-                if self._sharpness >= self._sharpness_peak:
-                    self._sharpness_peak   = self._sharpness
-                    self._sharpness_peak_t = _now
-                elif _now - self._sharpness_peak_t > 3.0:
-                    self._sharpness_peak = self._sharpness
-
-            # Only update UI preview every N frames and not in no_video mode
-            ui_counter += 1
-            if not no_video and ui_counter >= ui_every:
-                # Overlay FPS on the camera frame
-                disp = result.frame_display.copy() if result.frame_display is not None else None
-                if disp is not None:
-                    fps_txt = f"{_fps_display:.1f} fps"
-                    cv2.putText(disp, fps_txt, (6, 16),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                                (80, 220, 80), 1, cv2.LINE_AA)
-                    self._latest_cam_frame = disp
-                ui_counter = 0
-
-            try:
-                shot_ts = self._shot_queue.get_nowait()
-                if self._current_aim_mm is not None:
-                    if self._zero_mode:
-                        if self._tracking_quality > 0:
-                            # Markers visible — apply zero
-                            self._apply_zero(self._current_aim_mm)
-                        else:
-                            # No markers — ignore trigger, stay in zero mode
-                            self.root.after(0, lambda: self._set_status(
-                                "ZERO MODE — no markers, try again", GOLD))
-                    elif self._tracking_quality > 0:
-                        # quality > 0 means we have a valid homography
-                        # Pass shot_ts so record_shot can retroactively look up
-                        # the camera position at the exact audio trigger moment
-                        self._register_shot(self._current_aim_mm, shot_ts)
+                ui_counter += 1
+                if not no_video and ui_counter >= ui_every:
+                    if self._show_processed and result.processed is not None:
+                        preview = result.processed
                     else:
-                        # quality == 0: no homography at all, camera lost
-                        self.root.after(0, lambda: self._set_status(
-                            "SHOT REJECTED — no tracking", ACCENT2))
-            except queue.Empty:
+                        preview = result.frame_display
+                    self._publish_camera_frame(preview, self._live_fps)
+                    ui_counter = 0
+
+                self._drain_shot_queue()
+        finally:
+            try:
+                cap.release()
+            except Exception:
                 pass
+            if self._cap is cap:
+                self._cap = None
+            self._loop_done.set()
+
+    def _downscale_for_detection(self, frame, max_w: int, max_h: int):
+        """Resize ``frame`` so it fits within (max_w, max_h) for detection."""
+        fh, fw = frame.shape[:2]
+        if fw <= max_w and fh <= max_h:
+            return frame
+        scale = min(max_w / fw, max_h / fh)
+        return cv2.resize(
+            frame, (int(fw * scale), int(fh * scale)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    @staticmethod
+    def _apply_camera_zoom(frame, zoom: float):
+        """Centre-crop ``frame`` so it occupies ``1/zoom`` of each axis.
+
+        This is digital zoom: the cropped region is returned as-is and
+        downstream stages (resize for detection, draw, present) operate
+        on a smaller frame with proportionally larger marker pixels.
+        """
+        fh, fw = frame.shape[:2]
+        cw = max(1, int(fw / zoom))
+        ch = max(1, int(fh / zoom))
+        x0 = (fw - cw) // 2
+        y0 = (fh - ch) // 2
+        return frame[y0:y0 + ch, x0:x0 + cw]
+
+    @staticmethod
+    def _measure_sharpness(frame) -> float:
+        """Laplacian variance — proxy for focus quality."""
+        gray = (frame if len(frame.shape) == 2
+                else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _update_sharpness_peak(self) -> None:
+        now = time.time()
+        if self._sharpness >= self._sharpness_peak:
+            self._sharpness_peak = self._sharpness
+            self._sharpness_peak_t = now
+        elif now - self._sharpness_peak_t > 3.0:
+            self._sharpness_peak = self._sharpness
+
+    def _consume_aim(self, result) -> None:
+        """Apply zero, spike-filter, smooth and feed the session aim."""
+        raw = result.aim_mm
+        zeroed = (raw[0] - self._zero_offset[0],
+                  raw[1] - self._zero_offset[1])
+        if result.quality < 0.25:
+            return
+        filtered = self._reject_spike(zeroed)
+        self._raw_aim_prev2 = self._raw_aim_prev
+        self._raw_aim_prev = zeroed
+        smoothed = self._smoother.update(filtered)
+        self._current_aim_mm = smoothed
+        in_appr, on_tgt = self.session.update_aim(smoothed)
+        self._in_approach_zone = in_appr
+        self._on_target_status = on_tgt
+
+    def _publish_camera_frame(self, frame_display, live_fps: float) -> None:
+        """Annotate the latest detection frame and hand it to the UI thread."""
+        if frame_display is None:
+            return
+        disp = frame_display.copy()
+        cv2.putText(disp, f"{live_fps:.1f} fps", (6, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (80, 220, 80), 1, cv2.LINE_AA)
+        self._latest_cam_frame = disp
+        self._request_cam_refresh()
+
+    def _drain_shot_queue(self) -> None:
+        """Process any queued audio triggers against the current aim."""
+        try:
+            shot_ts = self._shot_queue.get_nowait()
+        except queue.Empty:
+            return
+
+        if self._current_aim_mm is None:
+            return
+
+        if self._zero_mode:
+            if self._tracking_quality > 0:
+                self._apply_zero(self._current_aim_mm)
+            else:
+                self.root.after(0, lambda: self._set_status(
+                    "ZERO MODE — no markers, try again", GOLD))
+            return
+
+        if self._tracking_quality > 0:
+            self._register_shot(self._current_aim_mm, shot_ts)
+        else:
+            self.root.after(0, lambda: self._set_status(
+                "SHOT REJECTED — no tracking", ACCENT2))
+
+    def _reject_spike(self, zeroed: tuple) -> tuple:
+        """Return ``zeroed`` unless it is a bad homography spike.
+
+        A spike is detected when the previous and current frames both
+        show large displacements but in nearly opposite directions:
+        genuine fast movement keeps direction; a marker dropout snaps
+        to a wrong position then back.
+        """
+        if self._raw_aim_prev is None or self._raw_aim_prev2 is None:
+            return zeroed
+
+        spike_velocity = float(self.cfg.get("spike_velocity_mm", 25.0))
+        reversal = float(self.cfg.get("spike_reversal", 0.7))
+
+        px, py = self._raw_aim_prev
+        vx = zeroed[0] - px
+        vy = zeroed[1] - py
+        speed = math.hypot(vx, vy)
+        if speed <= spike_velocity:
+            return zeroed
+
+        p2x, p2y = self._raw_aim_prev2
+        v2x = px - p2x
+        v2y = py - p2y
+        prev_speed = math.hypot(v2x, v2y)
+        if prev_speed <= spike_velocity:
+            return zeroed
+
+        dot = vx * v2x + vy * v2y
+        if dot < -reversal * speed * prev_speed:
+            # Discard the spike pair: roll the running history back one frame.
+            self._raw_aim_prev = self._raw_aim_prev2
+            return self._raw_aim_prev2
+        return zeroed
 
     def _on_shot_detected(self, ts):
         if self._paused:
@@ -802,46 +1000,38 @@ class SplattApp:
         self._shot_queue.put(ts)
 
     def _scoring_radius_mm(self) -> float:
-        """
-        R = card_radius + pellet_radius.
-        This is the single number that drives all scoring geometry.
-        Changing calibre in settings instantly changes all scoring bands.
-        """
-        card_r    = self.target_cfg["diameter_mm"] / 2.0
-        calibre   = float(self.cfg.get("scoring_calibre_mm",
-                          self.target_cfg.get("calibre_mm", 4.5)))
-        return card_r + calibre / 2.0
+        """Scoring radius derived from the target card and pellet calibre."""
+        return _compute_scoring_radius_mm(self.target_cfg, self.cfg)
 
     def _register_shot(self, aim_mm, shot_ts: float = None):
         if not self._series_started:
             return
-        R            = self._scoring_radius_mm()
-        mark_offsets = self.target_cfg.get("mark_offsets")  # None for single-mark
+        R = self._scoring_radius_mm()
+        mark_offsets = self.target_cfg.get("mark_offsets")
 
-        # Step 1: record the shot — this does the retroactive position lookup,
-        # correcting aim_mm to where the crosshair actually was at shot_ts.
-        # We pass a placeholder score of 0.0 and rescore after using the
-        # corrected position, so scoring and drawing use identical coordinates.
-        shot = self.session.record_shot(aim_mm, 0.0, 0,
-                                         shot_timestamp=shot_ts,
-                                         mark_index=0,
-                                         defer_write=True)
+        # Record first with a placeholder score so we can rescore using the
+        # retroactively corrected aim, ensuring scoring and rendering use
+        # the same coordinates.
+        shot = self.session.record_shot(
+            aim_mm, 0.0, 0,
+            shot_timestamp=shot_ts,
+            mark_index=0,
+            defer_write=True,
+        )
         if shot is None:
             self.root.after(0, lambda: self._set_status(
                 "SHOT REJECTED — outside approach zone", ACCENT2))
             return
 
-        # Step 2: score from the retroactively corrected position
-        score, ring, mark_idx = score_shot(shot.aim_mm, R,
-                                            decimal=self._decimal_scoring,
-                                            mark_offsets=mark_offsets)
-
-        # Step 3: update the shot with the correct score and mark
-        shot.score      = score
+        score, ring, mark_idx = score_shot(
+            shot.aim_mm, R,
+            decimal=self._decimal_scoring,
+            mark_offsets=mark_offsets,
+        )
+        shot.score = score
         shot.ring_index = ring
         shot.mark_index = mark_idx
 
-        # Step 4: rewrite the live CSV row with the correct score
         if self.session._writer and self.session._writer.is_open:
             self.session._writer.write_shot(shot)
 
@@ -850,20 +1040,16 @@ class SplattApp:
             self.root.after(0, lambda: self._set_status(
                 "Miss ignored (score 0)", TEXT_DIM))
             return
-        if shot is None:
-            self.root.after(0, lambda: self._set_status(
-                "SHOT REJECTED — outside approach zone", ACCENT2))
-            return
-        import time as _t
-        self._last_shot_fired_time = _t.time()
+
+        self._last_shot_fired_time = time.time()
         self._last_shot_info = shot
-        sc = shot.score
-        sc_s = f"{sc:.1f}" if sc != int(sc) else str(int(sc))
-        col = GOLD if sc >= 10 else (ACCENT if sc >= 9 else
-              TEXT_PRI if sc >= 7 else ACCENT2)
-        _lbl = (f"Shot #{shot.index} (mark {mark_idx+1}): {sc_s} pts"
-                if mark_offsets else f"Shot #{shot.index}: {sc_s} pts")
-        self.root.after(0, lambda lbl=_lbl, c=col: self._set_status(lbl, c))
+        sc_s = f"{score:.1f}" if score != int(score) else str(int(score))
+        col = (GOLD if score >= 10 else
+               ACCENT if score >= 9 else
+               TEXT_PRI if score >= 7 else ACCENT2)
+        label = (f"Shot #{shot.index} (mark {mark_idx + 1}): {sc_s} pts"
+                 if mark_offsets else f"Shot #{shot.index}: {sc_s} pts")
+        self.root.after(0, lambda lbl=label, c=col: self._set_status(lbl, c))
 
 
     def _open_camera_properties(self):
@@ -891,23 +1077,67 @@ class SplattApp:
         self._last_shot_fired_time = time.time()
         self._save_zero_offset()
         self.root.after(0, lambda: (
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC),
+            self._btn_zero.configure(text="◎  Zero"),
+            _set_toggle(self._btn_zero, False, accent_color=GOLD),
             self._set_status("ZEROED", ACCENT)
         ))
+    def _tick_periodic(self):
+        """Slow timer for non-camera UI updates.
 
-    # =========================================================================
-    # UPDATE LOOP
-    # =========================================================================
-
-    def _update_loop(self):
-        # Target display and scores run always (even without camera)
-        # so colour changes / shot edits reflect immediately
+        The target render carries live shot traces and the active aim
+        crosshair, so it has to repaint while the camera is running.
+        Score widgets and the audio meter only need a few Hz to look
+        live. Polling at 10 Hz instead of 30 Hz frees the Tk thread to
+        process native events (dropdown clicks, menus, focus) without
+        contention from the GIL-heavy camera worker.
+        """
         self._update_target_display()
-        self._update_scores()
+        self._refresh_score_widgets_if_dirty()
+        if self._running:
+            self._update_audio_meter()
+        self.root.after(100, self._tick_periodic)
+
+    def _request_cam_refresh(self):
+        """Coalesced request to repaint the camera preview.
+
+        Called from the camera worker thread after each published
+        frame. ``after_idle`` runs the repaint on the Tk thread when
+        it next has spare time, and the pending flag prevents queuing
+        multiple repaints if frames arrive faster than Tk can draw.
+        """
+        if self._cam_refresh_pending or not self._running:
+            return
+        self._cam_refresh_pending = True
+        self.root.after_idle(self._do_cam_refresh)
+
+    def _do_cam_refresh(self):
+        self._cam_refresh_pending = False
         if self._running:
             self._update_cam_display()
-            self._update_audio_meter()
-        self.root.after(33, self._update_loop)
+
+    def _refresh_score_widgets_if_dirty(self):
+        """Only repaint the score panel when its inputs have changed."""
+        ses = self.session
+        ss = ses.series_shots
+        sel_idx = (self._selected_shot.index
+                   if self._selected_shot is not None else None)
+        # Per-shot mutable bits (score, deletion, flags) feed into the
+        # signature so edits show up without rebuilding every frame.
+        shot_state = tuple(
+            (s.index, s.score, s.deleted, s.match_shot,
+             s.favourite, s.missed, bool(s.comments))
+            for s in ss
+        )
+        sig = (
+            shot_state, ses.current_series, sel_idx,
+            self._on_target_status, self._in_approach_zone,
+            self._show_bbox_shots, self._show_bbox_acp,
+            getattr(self, "_last_shot_info", None),
+        )
+        if sig == getattr(self, "_score_sig", None):
+            return
+        self._score_sig = sig
+        self._update_scores()
 
     def _update_cam_display(self):
         frame = self._latest_cam_frame
@@ -965,11 +1195,12 @@ class SplattApp:
         fading = self.session.get_fading_trace()
         fade_age = self.session.fading_age_s
 
-        # In editor mode pass only selected shots
+        # In editor mode, only render shots whose checkbox is ticked.
         if self._in_series_editor and self._editor_show_trace is not None:
+            shot_vars = self._editor_shot_vars
             sel_shots = [s for s in self.session.shots
-                         if self._editor_shot_vars.get(s.index,
-                             tk.BooleanVar(value=True)).get()]
+                         if s.index not in shot_vars
+                         or shot_vars[s.index].get()]
             show_tr  = self._editor_show_trace.get()
             show_acp = self._editor_show_acp.get()
         else:
@@ -1045,11 +1276,15 @@ class SplattApp:
         bbox = ses.bbox_shots_mm
         self._stat_labels["bbox_s"].config(
             text=f"{bbox[0]:.1f}×{bbox[1]:.1f}mm" if bbox and self._show_bbox_shots else "—")
-        acps = [s.aim_centrepoint for s in ss if s.aim_centrepoint]
-        if acps and self._show_bbox_acp:
-            ax = [a[0] for a in acps]; ay = [a[1] for a in acps]
-            self._stat_labels["bbox_a"].config(
-                text=f"{max(ax)-min(ax):.1f}×{max(ay)-min(ay):.1f}mm")
+        if self._show_bbox_acp:
+            acps = [s.aim_centrepoint for s in ss if s.aim_centrepoint]
+            if acps:
+                ax = [a[0] for a in acps]
+                ay = [a[1] for a in acps]
+                self._stat_labels["bbox_a"].config(
+                    text=f"{max(ax)-min(ax):.1f}×{max(ay)-min(ay):.1f}mm")
+            else:
+                self._stat_labels["bbox_a"].config(text="—")
         else:
             self._stat_labels["bbox_a"].config(text="—")
 
@@ -1075,44 +1310,62 @@ class SplattApp:
                 text=f"#{last.index} {sc_str}pts ({last.aim_mm[0]:+.1f},{last.aim_mm[1]:+.1f}){acp_s}{ot_s}",
                 fg=GOLD if sc >= 9 else (ACCENT if sc >= 7 else TEXT_SEC))
 
+    @staticmethod
+    def _shot_flags(shot: Shot) -> str:
+        """Compact flag string for the shot log."""
+        flags = ""
+        if not shot.match_shot:
+            flags += "S"
+        if shot.favourite:
+            flags += "★"
+        if shot.missed:
+            flags += "M"
+        if shot.comments:
+            flags += "✎"
+        return flags
+
+    @staticmethod
+    def _shot_log_tag(score: float) -> str:
+        """Colour tag for a shot in the shot log."""
+        if score >= 10:
+            return "ten"
+        if score >= 9:
+            return "nine"
+        if score >= 7:
+            return "mid"
+        if score > 0:
+            return "low"
+        return "miss"
+
     def _refresh_shot_log(self):
         log = self._shot_log
         log.config(state="normal")
         log.delete("1.0", "end")
-        log.insert("end", f"{'#':>3}  {'Sc':>5}  {'X':>6}  {'Y':>6}  {'T':>4}  Flg\n", "hdr")
+        log.insert("end",
+                   f"{'#':>3}  {'Sc':>5}  {'X':>6}  {'Y':>6}  {'T':>4}  Flg\n",
+                   "hdr")
         log.insert("end", "─" * 38 + "\n", "hdr")
-        shots_rev = list(reversed(self.session.shots[-40:]))
-        for shot in shots_rev:
+
+        for shot in reversed(self.session.shots[-40:]):
             if shot.deleted:
-                continue   # don't show deleted shots in log
-            sc   = shot.score
-            sc_s = f"{sc:.1f}" if sc != int(sc) else str(int(sc))
-            ot   = f"{shot.on_target_duration_s:.1f}"
-            # Build flag string
-            flags = ""
-            if not shot.match_shot: flags += "S"   # S = Sighter
-            if shot.favourite:      flags += "★"
-            if shot.missed:         flags += "M"
-            if shot.comments:       flags += "✎"
-            line = (f"{shot.index:>3}  {sc_s:>5}  "
-                    f"{shot.aim_mm[0]:>+6.1f}  {shot.aim_mm[1]:>+6.1f}  "
-                    f"{ot:>4}  {flags}\n")
-            tag  = ("ten"  if sc >= 10 else "nine" if sc >= 9 else
-                    "mid"  if sc >= 7  else "low"  if sc > 0  else "miss")
+                continue
+            score = shot.score
+            score_str = (f"{score:.1f}" if score != int(score)
+                         else str(int(score)))
+            line = (
+                f"{shot.index:>3}  {score_str:>5}  "
+                f"{shot.aim_mm[0]:>+6.1f}  {shot.aim_mm[1]:>+6.1f}  "
+                f"{shot.on_target_duration_s:>4.1f}  {self._shot_flags(shot)}\n"
+            )
             if self._selected_shot and self._selected_shot.index == shot.index:
                 log.insert("end", line, ("sel", "sel_bg"))
             else:
-                log.insert("end", line, tag)
+                log.insert("end", line, self._shot_log_tag(score))
         log.config(state="disabled")
 
     def _update_audio_meter(self):
         level = min(1.0, self.audio.current_level * 12)
         self._audio_var.set(level * 100)
-
-    # =========================================================================
-    # CONTROLS
-    # =========================================================================
-
     def _on_exp_mode(self):
         """Auto exposure checkbox changed — apply live."""
         if hasattr(self, '_exp_auto_var'):
@@ -1128,12 +1381,23 @@ class SplattApp:
             self._sharpness        = 0.0
             self._focus_frame.pack(fill="x", padx=6, pady=(0, 2),
                                    after=self._btn_focus.master)
-            self._btn_focus.config(text="◎ Focus assist: ON", fg=ACCENT, bg=BG_MID)
+            self._btn_focus.config(text="◎ Focus assist: ON")
         else:
             self._focus_frame.pack_forget()
             self._sharpness_var.set(0)
             self._focus_lbl.config(text="—", fg=TEXT_DIM)
-            self._btn_focus.config(text="◎ Focus assist: OFF", fg=TEXT_DIM, bg=BG_CARD)
+            self._btn_focus.config(text="◎ Focus assist: OFF")
+        _set_toggle(self._btn_focus, self._focus_active)
+
+    def _toggle_processed_view(self):
+        """Toggle showing the post-processed (tracker view) frame.
+
+        Helpful for tuning CLAHE, sharpen and zoom: the preview shows
+        exactly what the ArUco detector receives, so you can see if a
+        marker is washed out, soft, or split by uneven lighting.
+        """
+        self._show_processed = not self._show_processed
+        _set_toggle(self._btn_processed, self._show_processed)
 
     def _on_zoom_change(self, val=None):
         """Zoom slider changed — rebuild renderer at new scale."""
@@ -1141,6 +1405,13 @@ class SplattApp:
         if hasattr(self, "_zoom_lbl"):
             self._zoom_lbl.config(text=f"{self._zoom_factor:.2f}×")
         self.target_renderer = None   # force rebuild on next frame
+
+    def _on_cam_zoom_change(self, _val=None):
+        """Camera digital-zoom slider changed."""
+        self._cam_zoom = round(float(self._cam_zoom_var.get()), 1)
+        self._cam_zoom_lbl.config(text=f"{self._cam_zoom:.1f}×")
+        self.cfg["camera_zoom"] = self._cam_zoom
+        save_config(self.cfg)
 
     def _on_thresh_change(self, val=None):
         v = self._thresh_var.get()
@@ -1159,10 +1430,12 @@ class SplattApp:
         self.audio.pause(self._paused)
         btn = self._btn_pause
         if self._paused:
-            btn.config(text="▶  Resume", bg=GOLD, fg=BG_DARK)
+            btn.configure(text="▶  Resume")
+            _set_variant(btn, "warn")
             self._set_status("PAUSED", GOLD)
         else:
-            btn.config(text="❙❙  Pause", bg=BG_CARD, fg=TEXT_SEC)
+            btn.configure(text="❙❙  Pause")
+            _set_variant(btn, "default")
             self._set_status("LIVE" if self._running else "READY", ACCENT)
 
     def _save_zero_offset(self):
@@ -1177,13 +1450,15 @@ class SplattApp:
             return
         self._zero_mode = not self._zero_mode
         if self._zero_mode:
-            self._btn_zero.config(text="◎  Waiting…", bg=GOLD, fg=BG_DARK)
+            self._btn_zero.config(text="◎  Waiting…")
+            _set_toggle(self._btn_zero, True, accent_color=GOLD)
             self._set_status("ZERO MODE — fire one shot", GOLD)
             # Cancel fine-zero if active
             if self._fine_zero_mode:
                 self._cancel_fine_zero()
         else:
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC)
+            self._btn_zero.config(text="◎  Zero")
+            _set_toggle(self._btn_zero, False, accent_color=GOLD)
             self._set_status("LIVE" if self._running else "READY", ACCENT)
 
     def _toggle_fine_zero_mode(self):
@@ -1192,22 +1467,23 @@ class SplattApp:
             self._cancel_fine_zero()
             return
         self._fine_zero_mode = True
-        self._btn_fine_zero.config(
-            text="⊕  Click centre…", bg=GOLD, fg=BG_DARK)
+        self._btn_fine_zero.config(text="⊕  Click centre…")
+        _set_toggle(self._btn_fine_zero, True, accent_color=GOLD)
         self._set_status(
             "FINE ZERO — click your shot group centre on the target", GOLD)
         # Cancel normal zero mode if active
         if self._zero_mode:
             self._zero_mode = False
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC)
+            self._btn_zero.config(text="◎  Zero")
+            _set_toggle(self._btn_zero, False, accent_color=GOLD)
         # Bind click on target canvas
         self._tgt_canvas.bind("<Button-1>", self._on_fine_zero_click)
         self._tgt_canvas.config(cursor="crosshair")
 
     def _cancel_fine_zero(self):
         self._fine_zero_mode = False
-        self._btn_fine_zero.config(
-            text="⊕  Fine Zero", bg=BG_CARD, fg=TEXT_SEC)
+        self._btn_fine_zero.config(text="⊕  Fine Zero")
+        _set_toggle(self._btn_fine_zero, False, accent_color=GOLD)
         self._tgt_canvas.unbind("<Button-1>")
         self._tgt_canvas.config(cursor="")
         self._set_status("LIVE" if self._running else "READY", ACCENT)
@@ -1239,9 +1515,8 @@ class SplattApp:
         self.cfg["decimal_scoring"] = self._decimal_scoring
         save_config(self.cfg)
         self._btn_decimal.config(
-            text="DEC ON"  if self._decimal_scoring else "DEC OFF",
-            bg=ACCENT if self._decimal_scoring else BG_CARD,
-            fg=BG_DARK if self._decimal_scoring else TEXT_SEC)
+            text="DEC ON" if self._decimal_scoring else "DEC OFF")
+        _set_toggle(self._btn_decimal, self._decimal_scoring)
 
     def _cycle_rotation(self):
         """Cycle camera rotation: 0 → 90 → 180 → 270 → 0."""
@@ -1249,34 +1524,35 @@ class SplattApp:
         self.cfg["camera_rotation"] = self._camera_rotation
         save_config(self.cfg)
         if hasattr(self, "_btn_rotate"):
-            self._btn_rotate.config(text=f"↻ {self._camera_rotation}°",
-                                    bg=BG_CARD if self._camera_rotation == 0 else ACCENT,
-                                    fg=TEXT_SEC if self._camera_rotation == 0 else BG_DARK)
+            self._btn_rotate.config(text=f"↻ {self._camera_rotation}°")
+            _set_toggle(self._btn_rotate, self._camera_rotation != 0)
+
+    def _set_toggle_button(self, button: tk.Button, active: bool) -> None:
+        """Apply the standard accent/idle styling to a toggle button."""
+        accent = ACCENT
+        if hasattr(self, "_toggle_accents"):
+            accent = self._toggle_accents.get(id(button), ACCENT)
+        _set_toggle(button, active, accent_color=accent)
 
     def _toggle_acp(self):
         self._show_acp = not self._show_acp
-        self._btn_acp.config(bg=ACCENT if self._show_acp else BG_CARD,
-                              fg=BG_DARK if self._show_acp else TEXT_SEC)
+        self._set_toggle_button(self._btn_acp, self._show_acp)
 
     def _toggle_bbox_shots(self):
         self._show_bbox_shots = not self._show_bbox_shots
-        self._btn_bbox_s.config(bg=ACCENT if self._show_bbox_shots else BG_CARD,
-                                 fg=BG_DARK if self._show_bbox_shots else TEXT_SEC)
+        self._set_toggle_button(self._btn_bbox_s, self._show_bbox_shots)
 
     def _toggle_bbox_acp(self):
         self._show_bbox_acp = not self._show_bbox_acp
-        self._btn_bbox_a.config(bg=ACCENT if self._show_bbox_acp else BG_CARD,
-                                 fg=BG_DARK if self._show_bbox_acp else TEXT_SEC)
+        self._set_toggle_button(self._btn_bbox_a, self._show_bbox_acp)
 
     def _toggle_dot_mode(self):
         self._shot_dot_only = not self._shot_dot_only
-        self._btn_dot.config(bg=ACCENT if self._shot_dot_only else BG_CARD,
-                              fg=BG_DARK if self._shot_dot_only else TEXT_SEC)
+        self._set_toggle_button(self._btn_dot, self._shot_dot_only)
 
     def _toggle_group(self):
         self._show_group = not self._show_group
-        self._btn_group.config(bg=ACCENT if self._show_group else BG_CARD,
-                                fg=BG_DARK if self._show_group else TEXT_SEC)
+        self._set_toggle_button(self._btn_group, self._show_group)
 
     def _undo_shot(self):
         shot = self.session.undo_last_shot()
@@ -1309,8 +1585,9 @@ class SplattApp:
                     "Series is active. Stop recording and finish?"):
                 self.session.end_series()
                 self._series_started = False
-                self._btn_start_series.config(
-                    text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+                self._btn_start_series.configure(
+                    text="▶  Start Series")
+                _set_variant(self._btn_start_series, "accent")
                 self._set_status("Series stopped — file saved", GOLD)
             return
 
@@ -1336,9 +1613,9 @@ class SplattApp:
             return
 
         self._series_started = True
-        self._btn_start_series.config(
-            text="■  Series Active — click to stop",
-            bg=ACCENT2, fg=BG_DARK)
+        self._btn_start_series.configure(
+            text="■  Series Active — click to stop")
+        _set_variant(self._btn_start_series, "danger")
         sn = self.session.current_series
         self._set_status(f"● REC  Series {sn} — recording to {os.path.basename(path)}", ACCENT2)
 
@@ -1346,8 +1623,8 @@ class SplattApp:
         self.session.clear_series()
         self._series_started = False
         if hasattr(self, '_btn_start_series'):
-            self._btn_start_series.config(
-                text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+            self._btn_start_series.configure(text="▶  Start Series")
+            _set_variant(self._btn_start_series, "accent")
         self._selected_shot = None
         self._highlighted_trace = None
         self._set_status("READY — press Start Series", TEXT_SEC)
@@ -1364,10 +1641,11 @@ class SplattApp:
             self._series_started = False
             self._in_approach_zone = False
             self._in_series_editor = False
-            self._btn_zero.config(text="◎  Zero", bg=BG_CARD, fg=TEXT_SEC)
+            self._btn_zero.configure(text="◎  Zero")
+            _set_toggle(self._btn_zero, False, accent_color=GOLD)
             if hasattr(self, '_btn_start_series'):
-                self._btn_start_series.config(
-                    text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+                self._btn_start_series.configure(text="▶  Start Series")
+                _set_variant(self._btn_start_series, "accent")
             self._last_shot_lbl.config(text="Last shot: —", fg=TEXT_SEC)
             self._set_status("READY — press Start Series", TEXT_SEC)
             self._exit_series_editor()
@@ -1390,27 +1668,37 @@ class SplattApp:
     def _open_settings(self):
         SettingsDialog(self.root, self.cfg, self._apply_settings)
 
+    _CAM_RESTART_KEYS = frozenset({
+        "video_width", "video_height", "video_fps",
+        "camera_index", "no_video_mode",
+    })
+    _TRACKER_REBUILD_KEYS = frozenset({
+        "aruco_marker_mm", "aruco_margin_mm", "aruco_dict",
+        "use_clahe", "clahe_clip", "aruco_marker_count",
+        "brightness_target",
+    })
+
     def _apply_settings(self, new_cfg):
-        cam_keys = {"video_width", "video_height", "video_fps",
-                    "camera_index", "no_video_mode"}
-        cam_changed = any(new_cfg.get(k) != self.cfg.get(k) for k in cam_keys)
+        cam_changed = any(new_cfg.get(k) != self.cfg.get(k)
+                          for k in self._CAM_RESTART_KEYS)
+        tracker_changed = any(new_cfg.get(k) != self.cfg.get(k)
+                              for k in self._TRACKER_REBUILD_KEYS)
 
         self.cfg.update(new_cfg)
         save_config(self.cfg)
         self.target_cfg = TARGETS[self.cfg["target_key"]]
         self.target_renderer = None
 
-        # Audio — applies live
+        # Audio settings apply live.
         self.audio.set_threshold(self.cfg["audio_trigger_threshold"])
         self.audio.set_transient_ratio(self.cfg.get("audio_transient_ratio", 6.0))
         self.audio.set_cooldown(self.cfg["audio_trigger_cooldown_ms"])
         self._thresh_var.set(self.cfg["audio_trigger_threshold"])
         self._ratio_var.set(self.cfg.get("audio_transient_ratio", 6.0))
+        self._post_shot_cooldown_s = float(
+            self.cfg.get("post_shot_cooldown_s", 2.0))
 
-        # Cooldown — live
-        self._post_shot_cooldown_s = float(self.cfg.get("post_shot_cooldown_s", 2.0))
-
-        # Smoother — live, no restart needed
+        # Smoother is cheap to rebuild.
         self._smoother = make_smoother(
             self.cfg.get("smooth_mode", "ema"),
             alpha=float(self.cfg.get("smooth_alpha", 0.35)),
@@ -1419,9 +1707,7 @@ class SplattApp:
         )
         self._smoother.reset()
 
-        # Rebuild tracker if marker size changed
-        marker_keys = {"aruco_marker_mm", "aruco_margin_mm", "aruco_dict", "use_clahe", "clahe_clip", "aruco_marker_count", "brightness_target"}
-        if any(new_cfg.get(k) != self.cfg.get(k) for k in marker_keys):
+        if tracker_changed:
             self.tracker = ArucoTracker(
                 aruco_dict_name=self.cfg["aruco_dict"],
                 marker_size_mm=float(self.cfg.get("aruco_marker_mm", 40.0)),
@@ -1429,30 +1715,28 @@ class SplattApp:
                 use_clahe=bool(self.cfg.get("use_clahe", True)),
                 clahe_clip=float(self.cfg.get("clahe_clip", 4.0)),
                 marker_count=int(self.cfg.get("aruco_marker_count", 4)),
-                brightness_target=float(self.cfg.get("brightness_target", 128.0)),
+                brightness_target=float(
+                    self.cfg.get("brightness_target", 128.0)),
+                sharpen=float(self.cfg.get("sharpen", 0.0)),
             )
 
-        # Rotation — applies immediately to camera loop
         self._camera_rotation = int(self.cfg.get("camera_rotation", 0))
-        self._fine_zero_mode = False   # click-on-canvas zero fine-tune
+        self._fine_zero_mode = False
         if hasattr(self, "_btn_rotate"):
             rot = self._camera_rotation
-            self._btn_rotate.config(text=f"↻ {rot}°",
-                bg=BG_CARD if rot == 0 else ACCENT,
-                fg=TEXT_SEC if rot == 0 else BG_DARK)
+            self._btn_rotate.configure(text=f"↻ {rot}°")
+            _set_toggle(self._btn_rotate, rot != 0)
 
-        # Sync zero offset from config (reset via Settings takes effect now)
         self._zero_offset = (
             float(self.cfg.get("zero_offset_x", 0.0)),
             float(self.cfg.get("zero_offset_y", 0.0)),
         )
-        self._apply_session_cfg()  # push new cfg values into live session
+        self._apply_session_cfg()
 
-        # Camera resolution/fps — restart to take effect
         if cam_changed and self._running:
             self._set_status("Restarting camera with new settings…", GOLD)
             self._stop_camera()
-            self.root.after(600, self._start_camera)
+            self._start_camera()
 
     def _apply_session_cfg(self):
         """Push config values into the live session object."""
@@ -1460,16 +1744,14 @@ class SplattApp:
             self.cfg.get("fading_trace_duration_s", 2.0))
         self.session.acp_fraction = float(
             self.cfg.get("acp_fraction", 0.40))
-        from core.session import APPROACH_ZONE_FACTOR
         factor = float(self.cfg.get("approach_zone_factor",
                                      APPROACH_ZONE_FACTOR))
         R = self._scoring_radius_mm()
         self.session.scoring_radius_mm = R
-        # For multi-mark targets, the approach zone must cover the furthest mark
+        # For multi-mark targets, the approach zone must cover the furthest mark.
         mark_offsets = self.target_cfg.get("mark_offsets")
         if mark_offsets:
-            import math as _m
-            max_mark_r = max(_m.sqrt(mx**2 + my**2) for mx, my in mark_offsets)
+            max_mark_r = max(math.hypot(mx, my) for mx, my in mark_offsets)
             self.session.approach_radius_mm = (R + max_mark_r) * factor
         else:
             self.session.approach_radius_mm = R * factor
@@ -1491,8 +1773,8 @@ class SplattApp:
             self.session.end_series()
             self._series_started = False
             if hasattr(self, '_btn_start_series'):
-                self._btn_start_series.config(
-                    text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+                self._btn_start_series.configure(text="▶  Start Series")
+                _set_variant(self._btn_start_series, "accent")
         SeriesReviewWindow(self.root, self.session, self.cfg,
                            self.target_cfg,
                            on_next_series=self._start_next_series,
@@ -1504,8 +1786,6 @@ class SplattApp:
 
     def _set_status(self, text, color=TEXT_SEC):
         self._status_lbl.config(text=f"● {text}", fg=color)
-
-    # ── Shot log interactions ─────────────────────────────────────────────────
     def _shot_at_log_line(self, event):
         try:
             line_no = int(self._shot_log.index(
@@ -1605,12 +1885,8 @@ class SplattApp:
         def _save():
             shot.comments = var.get().strip()
             dlg.destroy()
-        tk.Button(bf, text="Save", command=_save,
-                  bg=ACCENT, fg=BG_DARK, font=("Segoe UI", 9),
-                  relief="flat", padx=10, pady=4).pack(side="right", padx=4)
-        tk.Button(bf, text="Cancel", command=dlg.destroy,
-                  bg=BG_CARD, fg=TEXT_SEC, font=("Segoe UI", 9),
-                  relief="flat", padx=10, pady=4).pack(side="right")
+        _mk_btn(bf, "Save", _save, accent=True).pack(side="right", padx=4)
+        _mk_btn(bf, "Cancel", dlg.destroy).pack(side="right")
 
     def _delete_shot(self, shot):
         if messagebox.askyesno("Delete", f"Delete shot #{shot.index}?"):
@@ -1621,19 +1897,14 @@ class SplattApp:
             if self._selected_shot and self._selected_shot.index == shot.index:
                 self._selected_shot = None
                 self._highlighted_trace = None
-
-    # =========================================================================
-    # SERIES COMPLETE EDITOR
-    # =========================================================================
-
     def _series_complete(self):
         """Finish shooting, save, enter review mode."""
         # End live file (also writes JSON)
         self.session.end_series()
         self._series_started = False
         if hasattr(self, '_btn_start_series'):
-            self._btn_start_series.config(
-                text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+            self._btn_start_series.configure(text="▶  Start Series")
+            _set_variant(self._btn_start_series, "accent")
         # Enter review mode
         self._in_series_editor = True
         for w in self._score_panel_frame.winfo_children():
@@ -1656,8 +1927,8 @@ class SplattApp:
         self._build_score_panel(self._score_panel_frame)
         self._set_status("READY — press Start Series", TEXT_SEC)
         if hasattr(self, '_btn_start_series'):
-            self._btn_start_series.config(
-                text="▶  Start Series", bg=ACCENT, fg=BG_DARK)
+            self._btn_start_series.configure(text="▶  Start Series")
+            _set_variant(self._btn_start_series, "accent")
 
     def _exit_series_editor(self):
         self._in_series_editor = False
@@ -1676,11 +1947,8 @@ class SplattApp:
         def _tog_btn(p, text, var, col=ACCENT):
             def cb():
                 var.set(not var.get())
-                btn.config(bg=col if var.get() else BG_CARD,
-                           fg=BG_DARK if var.get() else TEXT_SEC)
-            btn = _mk_btn(p, text, cb)
-            btn.config(bg=col if var.get() else BG_CARD,
-                       fg=BG_DARK if var.get() else TEXT_SEC)
+                _set_toggle(btn, var.get(), accent_color=col)
+            btn = _mk_toggle(p, text, var.get(), cb, accent_color=col)
             return btn
 
         _tog_btn(tog, "Trace",   self._editor_show_trace).pack(side="left", padx=(0,2))
@@ -1772,28 +2040,25 @@ class SplattApp:
     def _editor_select_all(self, value: bool):
         for var in self._editor_shot_vars.values():
             var.set(value)
-
-    # =========================================================================
-    # KEYBOARD
-    # =========================================================================
+    _KEY_BINDINGS = {
+        "p": "_toggle_pause",
+        "space": "_undo_shot",
+        "r": "_reset_all",
+        "q": "_on_close",
+        "s": "_save_csv",
+    }
 
     def _on_key(self, event):
-        k = event.keysym.lower()
-        if k == "p":         self._toggle_pause()
-        elif k == "space":   self._undo_shot()
-        elif k == "r":       self._reset_all()
-        elif k == "q":       self._on_close()
-        elif k == "s":       self._save_csv()
-
-    # =========================================================================
-    # LIFECYCLE
-    # =========================================================================
+        action = self._KEY_BINDINGS.get(event.keysym.lower())
+        if action:
+            getattr(self, action)()
 
     def _on_close(self):
         self._running = False
         self.audio.stop()
-        if self._cap:
-            self._cap.release()
+        # Let the camera loop release the capture itself; releasing
+        # from the UI thread can deadlock on macOS.
+        self._loop_done.wait(timeout=2.0)
         # Close live writer first
         self.session.end_series()
         # Save full JSON archive
@@ -1812,7 +2077,6 @@ class SplattApp:
 
     def _show_first_run_wizard(self):
         """Simple first-run setup wizard shown when no config file exists."""
-        from core.config import TARGETS, save_config
         dlg = tk.Toplevel(self.root)
         dlg.title("Welcome to Splatt2!")
         dlg.configure(bg=BG_DARK)
@@ -1880,20 +2144,28 @@ class SplattApp:
             dlg.destroy()
             self._set_status("Setup complete — print your marker sheet and start the camera!", ACCENT)
 
-        tk.Button(dlg, text="Let's go  ▶", command=_done,
-                  bg=ACCENT, fg=BG_DARK, font=("Segoe UI", 11, "bold"),
-                  relief="flat", padx=20, pady=8, cursor="hand2").pack(pady=20)
+        _go_btn = _mk_btn(dlg, "Let's go  ▶", _done, accent=True)
+        _go_btn.pack(pady=(20, 4))
+
+        def _print_now():
+            # Persist current wizard choices so the sheet uses the right
+            # target/distance, then open the marker sheet dialog over the
+            # wizard. The user can return here when they're done.
+            try:
+                self.cfg["real_range_m"] = float(dist_var.get())
+            except ValueError:
+                pass
+            self.cfg["target_key"] = target_var.get()
+            self.target_cfg = TARGETS[self.cfg["target_key"]]
+            MarkerSheetDialog(dlg, self.cfg)
+
+        _mk_btn(dlg, "🖨  Print marker sheet now", _print_now).pack(pady=(0, 16))
 
         # Prevent closing without completing
         dlg.protocol("WM_DELETE_WINDOW", _done)
 
     def run(self):
         self.root.mainloop()
-
-
-# =============================================================================
-# SETTINGS DIALOG
-# =============================================================================
 
 class MarkerSheetDialog(tk.Toplevel):
     def __init__(self, parent, cfg):
@@ -1907,7 +2179,6 @@ class MarkerSheetDialog(tk.Toplevel):
         self.geometry("500x520")
 
     def _build(self):
-        from core.marker_sheet import AIMING_MARKS, A4_W_MM
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -1922,7 +2193,6 @@ class MarkerSheetDialog(tk.Toplevel):
         pad = {"padx": 14, "pady": 5}  # keep for legacy refs
 
     def _build_sheet_tab(self, parent):
-        from core.marker_sheet import AIMING_MARKS, A4_W_MM
         pad = {"padx": 14, "pady": 5}
 
         tk.Label(parent, text="Generate Marker Sheet", bg=BG_DARK, fg=ACCENT,
@@ -1953,10 +2223,9 @@ class MarkerSheetDialog(tk.Toplevel):
         tk.Entry(r4, textvariable=self._mvar, width=6, bg=BG_CARD, fg=TEXT_PRI,
                  insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
         for sz in [25, 35, 40, 50]:
-            tk.Button(r4, text=str(sz),
-                      command=lambda v=sz: (self._mvar.set(str(v)), self._preview()),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r4, str(sz),
+                     lambda v=sz: (self._mvar.set(str(v)),
+                                   self._preview())).pack(side="left", padx=2)
         self._mvar.trace_add("write", lambda *_: self._preview())
 
         r5 = tk.Frame(parent, bg=BG_DARK); r5.pack(fill="x", **pad)
@@ -1973,11 +2242,9 @@ class MarkerSheetDialog(tk.Toplevel):
         self._sheet_calibre = tk.StringVar(
             value=str(self.cfg.get("scoring_calibre_mm", 4.5)))
         for label, val in [("4.5 (.177)", "4.5"), ("5.6 (.22)", "5.6")]:
-            tk.Button(r7, text=label,
-                      command=lambda v=val: (self._sheet_calibre.set(v),
-                                            self._preview()),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r7, label,
+                     lambda v=val: (self._sheet_calibre.set(v),
+                                    self._preview())).pack(side="left", padx=2)
         tk.Entry(r7, textvariable=self._sheet_calibre, width=5, bg=BG_CARD,
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
                  font=FM).pack(side="left", padx=(4,0))
@@ -2018,28 +2285,26 @@ class MarkerSheetDialog(tk.Toplevel):
         self._info.pack(fill="x", padx=14, pady=8)
 
         bf = tk.Frame(parent, bg=BG_DARK); bf.pack(fill="x", padx=14, pady=(4, 14))
-        tk.Button(bf, text="Generate & Open", command=self._generate,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  padx=12, pady=6).pack(side="right", padx=4)
-        tk.Button(bf, text="Cancel", command=self.destroy,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  padx=12, pady=6).pack(side="right", padx=4)
+        _mk_btn(bf, "Generate & Open", self._generate, accent=True).pack(side="right", padx=4)
+        _mk_btn(bf, "Cancel", self.destroy).pack(side="right", padx=4)
         self._preview()
 
     def _get(self):
-        from core.marker_sheet import AIMING_MARKS
-        key  = self._tvar.get()
+        key = self._tvar.get()
         mark = AIMING_MARKS.get(key, AIMING_MARKS["10m_air_rifle"])
-        try:    dist = float(self._dvar.get())
-        except: dist = mark["reference_dist_m"]
-        try:    marker_sz = max(10.0, float(self._mvar.get()))
-        except: marker_sz = 40.0
-        try:    margin_sz = max(3.0,  float(self._mgvar.get()))
-        except: margin_sz = 8.0
+
+        def _to_float(var, default):
+            try:
+                return float(var.get())
+            except (TypeError, ValueError):
+                return default
+
+        dist = _to_float(self._dvar, mark["reference_dist_m"])
+        marker_sz = max(10.0, _to_float(self._mvar, 40.0))
+        margin_sz = max(3.0, _to_float(self._mgvar, 8.0))
         return key, mark, dist, dist / mark["reference_dist_m"], marker_sz, margin_sz
 
     def _preview(self, *_):
-        from core.marker_sheet import A4_W_MM
         key, mark, dist, scale, marker_sz, margin_sz = self._get()
         # Centre space = A4 width - 2 margins - 2 markers (left+right)
         centre_space = A4_W_MM - 2 * margin_sz - 2 * marker_sz
@@ -2064,12 +2329,10 @@ class MarkerSheetDialog(tk.Toplevel):
             initialfile=f"splatt2_{key}_{dist:.0f}m.png")
         if not out:
             return
-        from core.marker_sheet import generate_marker_sheet
         _, _, _, _, marker_sz, margin_sz = self._get()
         # Save marker/margin back to cfg so tracker stays in sync
         self.cfg["aruco_marker_mm"] = marker_sz
         self.cfg["aruco_margin_mm"] = margin_sz
-        from core.config import save_config
         save_config(self.cfg)
         generate_marker_sheet(out, target_key=key, print_distance_m=dist,
                                show_ring_guides=self._rvar.get(),
@@ -2082,15 +2345,9 @@ class MarkerSheetDialog(tk.Toplevel):
         except Exception:
             pass
         self.destroy()
-
-    # ── Target Creator tab ────────────────────────────────────────────────────
-
     def _build_creator_tab(self, parent):
         """Target editor — create, edit and delete targets from the targets/ folder."""
-        from core.config import TARGETS, _targets_dir
         pad = {"padx": 10, "pady": 3}
-
-        # ── Mode selector: New or edit existing ──────────────────────────────
         top = tk.Frame(parent, bg=BG_DARK); top.pack(fill="x", **pad)
         tk.Label(top, text="Mode:", bg=BG_DARK, fg=TEXT_SEC,
                  font=FB, width=8, anchor="w").pack(side="left")
@@ -2101,11 +2358,8 @@ class MarkerSheetDialog(tk.Toplevel):
                                            width=30, font=FL)
         self._c_mode_combo.pack(side="left", padx=(0,6))
         self._c_mode_combo.bind("<<ComboboxSelected>>", self._on_creator_mode)
-        tk.Button(top, text="Delete", command=self._delete_target,
-                  bg=ACCENT2, fg=BG_DARK, font=FL, relief="flat",
-                  padx=6, pady=3, cursor="hand2").pack(side="left")
-
-        # ── Metadata fields ───────────────────────────────────────────────────
+        _del_btn = _mk_btn(top, "Delete", self._delete_target, danger=True)
+        _del_btn.pack(side="left")
         meta = tk.Frame(parent, bg=BG_DARK); meta.pack(fill="x", **pad)
 
         def _field(frame, label, var, width=20):
@@ -2147,11 +2401,9 @@ class MarkerSheetDialog(tk.Toplevel):
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
                  font=FM).pack(side="left")
         for lbl, val in [("4.5",4.5),("5.6",5.6)]:
-            tk.Button(r_cal, text=lbl,
-                      command=lambda v=val: (self._c_calibre.set(str(v)),
-                                            self._update_creator_preview()),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=1, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_cal, lbl,
+                     lambda v=val: (self._c_calibre.set(str(v)),
+                                    self._update_creator_preview())).pack(side="left", padx=2)
         tk.Label(r_cal, text="  Card dia (mm):", bg=BG_DARK, fg=TEXT_SEC,
                  font=FB).pack(side="left", padx=(8,0))
         tk.Entry(r_cal, textvariable=self._c_card, width=6, bg=BG_CARD,
@@ -2163,8 +2415,6 @@ class MarkerSheetDialog(tk.Toplevel):
         # Trace changes to update live preview
         for v in (self._c_calibre, self._c_card):
             v.trace_add("write", lambda *_: self._update_creator_preview())
-
-        # ── Ring data text area ───────────────────────────────────────────────
         tk.Label(parent,
                  text="Visual rings — score, ring_diameter_mm (innermost first):",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(anchor="nw", padx=10, pady=(4,1))
@@ -2178,21 +2428,15 @@ class MarkerSheetDialog(tk.Toplevel):
             "10, 0.5\n9, 5.5\n8, 10.5\n7, 15.5\n6, 20.5\n"
             "5, 25.5\n4, 30.5\n3, 35.5\n2, 40.5\n1, 45.5")
         self._c_rings_txt.bind("<KeyRelease>", lambda *_: self._update_creator_preview())
-
-        # ── Live scoring preview ──────────────────────────────────────────────
         self._c_preview = tk.Label(parent, text="", bg=BG_CARD, fg=ACCENT,
                                     font=("Consolas", 9), justify="left",
                                     anchor="nw", padx=8, pady=4)
         self._c_preview.pack(fill="x", padx=10, pady=(0,2))
-
-        # ── Status + buttons ─────────────────────────────────────────────────
         self._c_status = tk.Label(parent, text="", bg=BG_DARK, fg=ACCENT,
                                    font=FM, anchor="w")
         self._c_status.pack(fill="x", padx=10)
         bf = tk.Frame(parent, bg=BG_DARK); bf.pack(fill="x", padx=10, pady=(2,8))
-        tk.Button(bf, text="Save Target", command=self._save_target,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  padx=12, pady=5, cursor="hand2").pack(side="right")
+        _mk_btn(bf, "Save Target", self._save_target, accent=True).pack(side="right")
 
         self._update_creator_preview()
 
@@ -2226,7 +2470,6 @@ class MarkerSheetDialog(tk.Toplevel):
 
     def _on_creator_mode(self, event=None):
         """Load an existing target into the editor fields."""
-        from core.config import TARGETS
         mode = self._c_mode.get()
         if mode == "New target":
             self._c_key.set(""); self._c_name.set("")
@@ -2260,8 +2503,7 @@ class MarkerSheetDialog(tk.Toplevel):
         self._update_creator_preview()
 
     def _delete_target(self):
-        """Delete the selected existing target CSV."""
-        from core.config import TARGETS, _targets_dir
+        """Delete a user-created target CSV. Built-in targets can't be removed."""
         mode = self._c_mode.get()
         if mode == "New target":
             self._c_status.config(text="Select an existing target to delete.", fg=GOLD)
@@ -2270,29 +2512,31 @@ class MarkerSheetDialog(tk.Toplevel):
         t   = next((t for t in TARGETS.values() if t["name"] == key), None)
         if t is None:
             return
+        path = os.path.join(_user_targets_dir(), f"{t['key']}.csv")
+        if not os.path.isfile(path):
+            self._c_status.config(
+                text=f"'{t['name']}' is a built-in target and can't be deleted.",
+                fg=GOLD)
+            return
         if not messagebox.askyesno("Delete Target",
                 f"Permanently delete '{t['name']}' ({t['key']}.csv)?\n"
                 "This cannot be undone."):
             return
-        import os as _os
-        path = _os.path.join(_targets_dir(), f"{t['key']}.csv")
         try:
-            _os.remove(path)
+            os.remove(path)
             import core.config as _cc, core.marker_sheet as _ms
-            _cc.TARGETS.pop(t["key"], None)
-            from core.marker_sheet import _get_aiming_marks
+            # Reload — a built-in seed with the same key may now resurface.
+            _cc.TARGETS = _cc._load_all_targets()
             _ms.AIMING_MARKS = _get_aiming_marks()
             self._c_status.config(text=f"Deleted '{t['name']}'.", fg=ACCENT)
-            # Refresh mode dropdown
             modes = ["New target"] + [f"Edit: {tgt['name']}" for tgt in _cc.TARGETS.values()]
             self._c_mode_combo["values"] = modes
             self._c_mode.set("New target")
-        except Exception as e:
+        except OSError as e:
             self._c_status.config(text=f"Delete failed: {e}", fg=ACCENT2)
 
     def _save_target(self):
-        """Validate and save the target as a CSV in the targets/ folder."""
-        from core.config import _targets_dir, _load_target_csv
+        """Validate and save the target as a CSV in the user targets dir."""
         import core.config as _cc, core.marker_sheet as _ms
 
         key  = self._c_key.get().strip().replace(" ","_")
@@ -2332,7 +2576,7 @@ class MarkerSheetDialog(tk.Toplevel):
             card_d = diameters[-1]
 
         # Check if overwriting a file
-        tdir  = _targets_dir()
+        tdir  = _user_targets_dir()
         os.makedirs(tdir, exist_ok=True)
         fname = f"{key}.csv"
         path  = os.path.join(tdir, fname)
@@ -2365,7 +2609,6 @@ class MarkerSheetDialog(tk.Toplevel):
         t = _load_target_csv(path)
         if t:
             _cc.TARGETS[t["key"]] = t
-            from core.marker_sheet import _get_aiming_marks
             _ms.AIMING_MARKS = _get_aiming_marks()
             # Refresh mode dropdown
             modes = ["New target"] + [f"Edit: {tgt['name']}" for tgt in _cc.TARGETS.values()]
@@ -2374,11 +2617,6 @@ class MarkerSheetDialog(tk.Toplevel):
         self._c_status.config(
             text=f"Saved '{name}' → {fname}  (available immediately)",
             fg=ACCENT)
-
-# =============================================================================
-# SESSION HISTORY WINDOW
-# =============================================================================
-
 class SessionHistoryWindow(tk.Toplevel):
     def __init__(self, parent, save_dir, cfg):
         super().__init__(parent)
@@ -2441,7 +2679,6 @@ class SessionHistoryWindow(tk.Toplevel):
         self.after(200, self._init_renderer)
 
     def _init_renderer(self):
-        from core.target_renderer import TargetRenderer
         w = self._tgt.winfo_width()
         h = self._tgt.winfo_height()
         if w < 50 or h < 50:
@@ -2452,7 +2689,6 @@ class SessionHistoryWindow(tk.Toplevel):
         self._redraw()
 
     def _load(self):
-        from core.session import load_session_history
         # _history is {day_label: [entry, ...]} newest day first
         self._history_dict = load_session_history(self.save_dir)
         # Flatten to a list for display, newest first
@@ -2487,7 +2723,6 @@ class SessionHistoryWindow(tk.Toplevel):
             pass
 
     def _show(self, idx):
-        from core.session import reconstruct_shot_traces
         e = self._history[idx]
         self._sel = e
         dur = e["duration_s"]
@@ -2517,7 +2752,6 @@ class SessionHistoryWindow(tk.Toplevel):
     def _redraw(self):
         if self._renderer is None:
             return
-        from core.session import Shot, ShotTrace, TracePoint, reconstruct_shot_traces
         shots = []
         if self._sel:
             traces = reconstruct_shot_traces(self._sel["raw"])
@@ -2542,16 +2776,6 @@ class SessionHistoryWindow(tk.Toplevel):
         self._tgt._img = photo
 
 
-# =============================================================================
-# SERIES REVIEW WINDOW
-# =============================================================================
-
-
-
-# =============================================================================
-# SETTINGS DIALOG  (scrollable tabs, resizable)
-# =============================================================================
-
 class SettingsDialog(tk.Toplevel):
     """Scrollable settings dialog — each tab has a canvas+scrollbar so nothing
     is ever clipped regardless of screen size or font scaling."""
@@ -2564,25 +2788,18 @@ class SettingsDialog(tk.Toplevel):
         self.configure(bg=BG_DARK)
         self.resizable(True, True)
         self.grab_set()
-        self.geometry("560x680")
         self.minsize(480, 500)
+        self._tab_inners: list[tk.Frame] = []
         self._build()
-
-    # ── shell ─────────────────────────────────────────────────────────────────
-
+        self.after(60, self._size_to_content)
     def _build(self):
         # Fixed button row at BOTTOM (always visible)
         btn_row = tk.Frame(self, bg=BG_DARK)
         btn_row.pack(side="bottom", fill="x", padx=8, pady=8)
-        tk.Button(btn_row, text="Apply & Close", command=self._apply_and_close,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  padx=12, pady=7).pack(side="right", padx=4)
-        tk.Button(btn_row, text="Apply", command=self._apply,
-                  bg=BG_CARD, fg=ACCENT, font=FB, relief="flat",
-                  padx=12, pady=7).pack(side="right", padx=4)
-        tk.Button(btn_row, text="Cancel", command=self.destroy,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  padx=12, pady=7).pack(side="right", padx=4)
+        _mk_btn(btn_row, "Apply & Close", self._apply_and_close,
+                accent=True).pack(side="right", padx=4)
+        _mk_btn(btn_row, "Apply", self._apply).pack(side="right", padx=4)
+        _mk_btn(btn_row, "Cancel", self.destroy).pack(side="right", padx=4)
         self._status_lbl = tk.Label(btn_row, text="", bg=BG_DARK,
                                      fg=ACCENT, font=FL)
         self._status_lbl.pack(side="left", padx=8)
@@ -2626,11 +2843,30 @@ class SettingsDialog(tk.Toplevel):
                          c.unbind_all("<MouseWheel>"))
 
             builder(inner)
+            self._tab_inners.append(inner)
             # Force scroll region now that content is populated
             self.after(50, _refresh)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    def _size_to_content(self) -> None:
+        """Resize the dialog so the tallest tab fits without scrolling."""
+        if not self._tab_inners:
+            return
+        for inner in self._tab_inners:
+            inner.update_idletasks()
+        content_w = max(inner.winfo_reqwidth() for inner in self._tab_inners)
+        content_h = max(inner.winfo_reqheight() for inner in self._tab_inners)
 
+        # Add the chrome: notebook tabs, button row, scrollbar, padding.
+        chrome_w = 60
+        chrome_h = 110
+
+        # Cap to 90% of the screen so the dialog never overflows it.
+        max_w = int(self.winfo_screenwidth() * 0.9)
+        max_h = int(self.winfo_screenheight() * 0.9)
+
+        width = min(max_w, max(self.winfo_reqwidth(), content_w + chrome_w))
+        height = min(max_h, max(self.winfo_reqheight(), content_h + chrome_h))
+        self.geometry(f"{width}x{height}")
     def _row(self, parent, label, widget_fn):
         r = tk.Frame(parent, bg=BG_DARK)
         r.pack(fill="x", padx=12, pady=4)
@@ -2660,9 +2896,6 @@ class SettingsDialog(tk.Toplevel):
         setattr(self, f"_v_{key}", v)
         return ttk.Combobox(parent, textvariable=v, values=values,
                              width=18, state="readonly", font=FM)
-
-    # ── Camera tab ────────────────────────────────────────────────────────────
-
     def _build_cam(self, tab):
         self._section(tab, "Camera")
         self._row(tab, "Camera index", lambda p: self._entry(p, "camera_index", 4))
@@ -2680,11 +2913,10 @@ class SettingsDialog(tk.Toplevel):
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
         for lbl, (w, h) in [("480×360",(480,360)),("640×480",(640,480)),
                              ("1280×720",(1280,720))]:
-            tk.Button(r, text=lbl,
-                      command=lambda w=w,h=h: (self._v_video_width.set(str(w)),
-                                               self._v_video_height.set(str(h))),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r, lbl,
+                     lambda w=w,h=h: (self._v_video_width.set(str(w)),
+                                      self._v_video_height.set(str(h)))
+                     ).pack(side="left", padx=2)
 
         # FPS
         r2 = tk.Frame(tab, bg=BG_DARK); r2.pack(fill="x", padx=12, pady=4)
@@ -2694,13 +2926,11 @@ class SettingsDialog(tk.Toplevel):
         tk.Entry(r2, textvariable=self._v_video_fps, width=5, bg=BG_CARD,
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat", font=FM).pack(side="left")
         for fps in [30, 60, 120]:
-            tk.Button(r2, text=str(fps),
-                      command=lambda f=fps: self._v_video_fps.set(str(f)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
-        tk.Button(r2, text="Detect", command=self._detect_camera_caps,
-                  bg=BG_CARD, fg=ACCENT, font=FL, relief="flat",
-                  padx=6, pady=2, cursor="hand2").pack(side="left", padx=(8, 0))
+            _mk_chip(r2, str(fps),
+                     lambda f=fps: self._v_video_fps.set(str(f))
+                     ).pack(side="left", padx=2)
+        _mk_chip(r2, "Detect", self._detect_camera_caps).pack(
+            side="left", padx=(8, 0))
         self._cam_caps_lbl = tk.Label(r2, text="", bg=BG_DARK, fg=TEXT_DIM, font=FL)
         self._cam_caps_lbl.pack(side="left", padx=4)
 
@@ -2797,10 +3027,9 @@ class SettingsDialog(tk.Toplevel):
                  fg=TEXT_PRI, insertbackground=ACCENT, relief="flat",
                  font=FM).pack(side="left")
         for lbl, val in [("2",2.0),("4",4.0),("6",6.0),("8",8.0),("12",12.0)]:
-            tk.Button(r_cc, text=lbl,
-                      command=lambda v=val: self._v_clahe_clip.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_cc, lbl,
+                     lambda v=val: self._v_clahe_clip.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_cc, text="  2=mild  4=balanced  8=aggressive  12=extreme",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2814,10 +3043,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for lbl, val in [("64",64),("96",96),("128",128),("160",160),("192",192)]:
-            tk.Button(r_bt, text=lbl,
-                      command=lambda v=val: self._v_brightness_target.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_bt, lbl,
+                     lambda v=val: self._v_brightness_target.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_bt, text="  lower=darker/faster  128=balanced  higher=brighter",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2835,10 +3063,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for lbl, val in [("15",15),("20",20),("25",25),("35",35),("50",50)]:
-            tk.Button(r_sv, text=lbl,
-                      command=lambda v=val: self._v_spike_velocity_mm.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_sv, lbl,
+                     lambda v=val: self._v_spike_velocity_mm.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_sv, text="  lower=more sensitive  25=default  higher=less sensitive",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2851,17 +3078,13 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for lbl, val in [("0.5",0.5),("0.6",0.6),("0.7",0.7),("0.8",0.8),("0.9",0.9)]:
-            tk.Button(r_sr, text=lbl,
-                      command=lambda v=val: self._v_spike_reversal.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_sr, lbl,
+                     lambda v=val: self._v_spike_reversal.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_sr, text="  0.5=loose  0.7=default  0.9=strict",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
         tk.Frame(tab, bg=BG_DARK, height=16).pack()   # bottom padding
-
-    # ── Audio tab ─────────────────────────────────────────────────────────────
-
     def _build_audio(self, tab):
         self._section(tab, "Shot Detection")
         self._note(tab, "Threshold: absolute peak floor (0.01–1.0)\n"
@@ -2882,9 +3105,6 @@ class SettingsDialog(tk.Toplevel):
                  ).pack(anchor="nw", padx=16)
         self._row(tab, "Device index (blank=auto)", lambda p: self._entry(p, "audio_device_index", 4))
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
-
-    # ── Target tab ────────────────────────────────────────────────────────────
-
     def _build_target(self, tab):
         self._section(tab, "Target & Range")
         self._row(tab, "Target type",
@@ -2900,11 +3120,9 @@ class SettingsDialog(tk.Toplevel):
                                      font=FM)
         self._zero_x_lbl.pack(side="left")
         self._update_zero_display()
-        tk.Button(r_zo, text="Reset to (0, 0)",
-                  command=self._reset_zero_offset,
-                  bg=ACCENT2, fg=BG_DARK, font=FL, relief="flat",
-                  padx=8, pady=3, cursor="hand2"
-                  ).pack(side="right")
+        _reset_zero_btn = _mk_btn(r_zo, "Reset to (0, 0)",
+                                  self._reset_zero_offset, danger=True)
+        _reset_zero_btn.pack(side="right")
 
         tk.Label(tab, text="Shot Handling", bg=BG_DARK, fg=ACCENT,
                  font=FT).pack(anchor="nw", padx=12, pady=(10, 4))
@@ -2921,10 +3139,9 @@ class SettingsDialog(tk.Toplevel):
                              insertbackground=ACCENT, relief="flat", font=FM)
         cal_entry.pack(side="left")
         for label, val in [("4.5",4.5),("5.6",5.6)]:
-            tk.Button(r_cal, text=label,
-                      command=lambda v=val: self._v_scoring_calibre.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r_cal, label,
+                     lambda v=val: self._v_scoring_calibre.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Label(r_cal, text="  affects scoring bands & approach zone",
                  bg=BG_DARK, fg=TEXT_DIM, font=FL).pack(side="left", padx=4)
 
@@ -2958,21 +3175,12 @@ class SettingsDialog(tk.Toplevel):
         setattr(self, "_v_save_directory", v)
         tk.Entry(r, textvariable=v, width=22, bg=BG_CARD, fg=TEXT_PRI,
                  insertbackground=ACCENT, relief="flat", font=FM).pack(side="left", padx=(0,4))
-        tk.Button(r, text="Browse…", command=self._browse_save_dir,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FL, relief="flat",
-                  padx=6, pady=3, cursor="hand2").pack(side="left")
+        _mk_chip(r, "Browse…", self._browse_save_dir).pack(side="left")
         def _use_default():
             v.set("")
             self._status_lbl.config(text="Reset to default location")
-        tk.Button(r, text="↺ Default", command=_use_default,
-                  bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                  padx=6, pady=3, cursor="hand2").pack(side="left", padx=2)
+        _mk_chip(r, "↺ Default", _use_default).pack(side="left", padx=2)
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
-
-    # ── Collect / Apply ───────────────────────────────────────────────────────
-
-    # ── Colours & Display tab ────────────────────────────────────────────────
-
     def _build_colours(self, tab):
         self._note(tab, "Click a swatch to pick a colour. Changes apply on Apply.")
 
@@ -3002,10 +3210,9 @@ class SettingsDialog(tk.Toplevel):
                  font=FB, width=24, anchor="w").pack(side="left")
         self._v_trace_width = tk.StringVar(value=str(self.cfg.get("trace_width", 1)))
         for w in [1, 2, 3, 4]:
-            tk.Button(r, text=str(w),
-                      command=lambda v=w: self._v_trace_width.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FB, relief="flat",
-                      padx=8, pady=3, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r, str(w),
+                     lambda v=w: self._v_trace_width.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Entry(r, textvariable=self._v_trace_width, width=3,
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left", padx=4)
@@ -3019,10 +3226,9 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG_CARD, fg=TEXT_PRI, insertbackground=ACCENT,
                  relief="flat", font=FM).pack(side="left")
         for s in [1, 2, 4, 8]:
-            tk.Button(r2, text=str(s),
-                      command=lambda v=s: self._v_fading_trace_duration_s.set(str(v)),
-                      bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
-                      padx=4, pady=2, cursor="hand2").pack(side="left", padx=2)
+            _mk_chip(r2, str(s),
+                     lambda v=s: self._v_fading_trace_duration_s.set(str(v))
+                     ).pack(side="left", padx=2)
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
 
     def _colour_row(self, parent, label: str, key: str):
@@ -3057,12 +3263,7 @@ class SettingsDialog(tk.Toplevel):
                                title=f"Choose colour — {label}")
             if result and result[1]:
                 v.set(result[1].upper())
-        tk.Button(r, text="Pick…", command=_pick,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FL, relief="flat",
-                  padx=6, pady=2, cursor="hand2").pack(side="left", padx=(4, 0))
-
-    # ── Advanced tab ──────────────────────────────────────────────────────────
-
+        _mk_chip(r, "Pick…", _pick).pack(side="left", padx=(4, 0))
     def _build_advanced(self, tab):
         self._section(tab, "Shooter Profile")
         self._row(tab, "Shooter name",
@@ -3200,22 +3401,21 @@ class SettingsDialog(tk.Toplevel):
             idx = 0
         self._cam_caps_lbl.config(text="Probing…")
         self.update()
-        import cv2 as _cv2
-        cap = _cv2.VideoCapture(idx, _cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(idx, _camera_backend())
         if not cap.isOpened():
-            cap = _cv2.VideoCapture(idx)
+            cap = cv2.VideoCapture(idx)
         if not cap.isOpened():
             self._cam_caps_lbl.config(text="Not found")
             return
         results = []
         for (w, h) in [(480,360),(640,480),(1280,720),(1920,1080)]:
-            cap.set(_cv2.CAP_PROP_FRAME_WIDTH,  w)
-            cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, h)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
             for fps_try in (60, 30):
-                cap.set(_cv2.CAP_PROP_FPS, fps_try)
-                aw = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
-                ah = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
-                af = cap.get(_cv2.CAP_PROP_FPS)
+                cap.set(cv2.CAP_PROP_FPS, fps_try)
+                aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                af = cap.get(cv2.CAP_PROP_FPS)
                 if aw == w and ah == h:
                     results.append(f"{w}×{h}@{af:.0f}")
                     break
@@ -3229,11 +3429,6 @@ class SettingsDialog(tk.Toplevel):
                 self._v_video_fps.set(parts[2])
         else:
             self._cam_caps_lbl.config(text="No modes found")
-
-
-# =============================================================================
-# SERIES REVIEW WINDOW  (series picker, working toggles, scrollable shot list)
-# =============================================================================
 
 class SeriesReviewWindow(tk.Toplevel):
     """
@@ -3270,6 +3465,17 @@ class SeriesReviewWindow(tk.Toplevel):
         self._dot_only    = tk.BooleanVar(value=False)
         self._show_group  = tk.BooleanVar(value=False)
 
+        # Trace player state. ``_player_mode`` toggles between the
+        # checkbox-driven viewer (default) and the per-shot replay
+        # player; ``_player_pos`` is the playhead in seconds.
+        self._player_mode = False
+        self._player_shot = None
+        self._player_pos = 0.0
+        self._player_speed = 1.0
+        self._player_playing = False
+        self._player_after_id = None
+        self._player_last_tick = 0.0
+
         self.title("Series Review — Splatt2")
         self.configure(bg=BG_DARK)
         self.geometry("1200x750")
@@ -3279,13 +3485,7 @@ class SeriesReviewWindow(tk.Toplevel):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, self._init_renderer)
-
-    # =========================================================================
-    # BUILD
-    # =========================================================================
-
     def _build(self):
-        # ── Top bar: two-dropdown day / series picker ───────────────────────
         top = tk.Frame(self, bg=BG_MID)
         top.pack(side="top", fill="x")
 
@@ -3305,14 +3505,11 @@ class SeriesReviewWindow(tk.Toplevel):
         self._series_combo.pack(side="left", pady=10)
         self._series_combo.bind("<<ComboboxSelected>>", self._on_series_selected)
 
-        tk.Button(top, text="⟳", command=self._populate_series_picker,
-                  bg=BG_MID, fg=TEXT_SEC, font=FL, relief="flat",
-                  cursor="hand2", padx=6).pack(side="left", padx=4)
+        _mk_btn(top, "⟳", self._populate_series_picker).pack(
+            side="left", padx=4)
 
         self._view_lbl = tk.Label(top, text="", bg=BG_MID, fg=TEXT_DIM, font=FL)
         self._view_lbl.pack(side="right", padx=12)
-
-        # ── Body ─────────────────────────────────────────────────────────────
         body = tk.Frame(self, bg=BG_DARK)
         body.pack(fill="both", expand=True)
 
@@ -3331,7 +3528,6 @@ class SeriesReviewWindow(tk.Toplevel):
         self._build_right(right)
 
     def _build_right(self, parent):
-        # ── Stats ─────────────────────────────────────────────────────────────
         sc = tk.Frame(parent, bg=BG_CARD)
         sc.pack(fill="x", padx=6, pady=(6, 3))
         tk.Label(sc, text="STATISTICS", bg=BG_CARD, fg=TEXT_DIM,
@@ -3358,8 +3554,6 @@ class SeriesReviewWindow(tk.Toplevel):
                              font=FM, anchor="w")
                 v.pack(side="left", padx=(2,8))
                 self._stat_lbls[key] = v
-
-        # ── Display toggles ────────────────────────────────────────────────────
         tc = tk.Frame(parent, bg=BG_PANEL)
         tc.pack(fill="x", padx=6, pady=(0, 4))
         tk.Label(tc, text="DISPLAY", bg=BG_PANEL, fg=TEXT_DIM,
@@ -3386,8 +3580,6 @@ class SeriesReviewWindow(tk.Toplevel):
             btn = self._make_tog_btn(r2, text, var, col)
             btn.pack(side="left", padx=(0, 2))
             self._tog_buttons[key] = btn
-
-        # ── Shot list ──────────────────────────────────────────────────────────
         lc = tk.Frame(parent, bg=BG_CARD)
         lc.pack(fill="both", expand=True, padx=6, pady=(0, 3))
 
@@ -3396,14 +3588,10 @@ class SeriesReviewWindow(tk.Toplevel):
         hdr.pack(fill="x", padx=6, pady=(4, 2))
         tk.Label(hdr, text="SHOTS  (✓=show, ✕=delete)",
                  bg=BG_CARD, fg=TEXT_DIM, font=FL).pack(side="left")
-        tk.Button(hdr, text="All",
-                  command=lambda: self._select_all(True),
-                  bg=BG_CARD, fg=TEXT_DIM, font=FL,
-                  relief="flat", padx=4, cursor="hand2").pack(side="right")
-        tk.Button(hdr, text="None",
-                  command=lambda: self._select_all(False),
-                  bg=BG_CARD, fg=TEXT_DIM, font=FL,
-                  relief="flat", padx=4, cursor="hand2").pack(side="right")
+        _mk_chip(hdr, "All",
+                 lambda: self._select_all(True)).pack(side="right")
+        _mk_chip(hdr, "None",
+                 lambda: self._select_all(False)).pack(side="right")
 
         # Scrollable shot rows
         sf2 = tk.Frame(lc, bg=BG_DARK)
@@ -3431,44 +3619,93 @@ class SeriesReviewWindow(tk.Toplevel):
             self._list_canvas.yview_scroll(int(-1*(e.delta/120)), "units")
         self._list_canvas.bind("<MouseWheel>", _wheel)
 
-        # ── Actions ────────────────────────────────────────────────────────────
+        self._build_trace_player(parent)
+
         bf = tk.Frame(parent, bg=BG_PANEL)
         bf.pack(fill="x", padx=6, pady=(0, 6))
-        tk.Button(bf, text="▶  Next Series",
-                  command=self._next_series,
-                  bg=ACCENT, fg=BG_DARK, font=FB, relief="flat",
-                  pady=6, cursor="hand2").pack(fill="x", pady=1)
-        tk.Button(bf, text="💾  Save CSV",
-                  command=self._save,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  pady=5, cursor="hand2").pack(fill="x", pady=1)
-        tk.Button(bf, text="✕  Close",
-                  command=self._on_close,
-                  bg=BG_CARD, fg=TEXT_SEC, font=FB, relief="flat",
-                  pady=5, cursor="hand2").pack(fill="x", pady=1)
+        _mk_btn(bf, "▶  Next Series", self._next_series,
+                accent=True).pack(fill="x", pady=1)
+        _mk_btn(bf, "💾  Save CSV", self._save).pack(fill="x", pady=1)
+        _mk_btn(bf, "✕  Close", self._on_close).pack(fill="x", pady=1)
+
+    def _build_trace_player(self, parent):
+        """Build the per-shot trace replay panel.
+
+        The card has two modes:
+
+        - **View** (default): the regular review behaviour with the
+          shot-list checkboxes deciding which traces are drawn.
+        - **Play**: focuses on a single shot, lets the user scrub
+          through its sampled aim trace or play it back at a chosen
+          speed. Other shots are hidden while in this mode.
+        """
+        pc = tk.Frame(parent, bg=BG_CARD)
+        pc.pack(fill="x", padx=6, pady=(0, 4))
+
+        hdr = tk.Frame(pc, bg=BG_CARD)
+        hdr.pack(fill="x", padx=8, pady=(4, 2))
+        tk.Label(hdr, text="TRACE PLAYER", bg=BG_CARD, fg=TEXT_DIM,
+                 font=FL).pack(side="left")
+        self._player_mode_btn = _mk_chip(
+            hdr, "Play mode: OFF", self._toggle_player_mode)
+        self._player_mode_btn.pack(side="right")
+
+        # Body holds all the playback controls. It is hidden whenever
+        # the player is in View mode so the panel stays compact.
+        self._player_body = tk.Frame(pc, bg=BG_CARD)
+
+        sel = tk.Frame(self._player_body, bg=BG_CARD)
+        sel.pack(fill="x", padx=6, pady=(0, 2))
+        tk.Label(sel, text="Shot:", bg=BG_CARD, fg=TEXT_DIM,
+                 font=FL).pack(side="left")
+        self._player_shot_var = tk.StringVar()
+        self._player_shot_combo = ttk.Combobox(
+            sel, textvariable=self._player_shot_var,
+            state="readonly", width=12, font=FL)
+        self._player_shot_combo.pack(side="left", padx=4)
+        self._player_shot_combo.bind(
+            "<<ComboboxSelected>>", self._on_player_shot_selected)
+
+        ctl = tk.Frame(self._player_body, bg=BG_CARD)
+        ctl.pack(fill="x", padx=6, pady=(0, 2))
+        self._player_play_btn = _mk_btn(ctl, "▶", self._player_toggle_play)
+        self._player_play_btn.pack(side="left", padx=(0, 2))
+        _mk_chip(ctl, "↺", self._player_reset).pack(side="left", padx=(0, 4))
+        tk.Label(ctl, text="Speed", bg=BG_CARD, fg=TEXT_DIM,
+                 font=FL).pack(side="left")
+        self._player_speed_var = tk.StringVar(value="1×")
+        speed_combo = ttk.Combobox(
+            ctl, textvariable=self._player_speed_var,
+            values=["0.25×", "0.5×", "1×", "2×", "4×"],
+            state="readonly", width=5, font=FL)
+        speed_combo.pack(side="left", padx=4)
+        speed_combo.bind("<<ComboboxSelected>>", self._on_player_speed)
+
+        scrub = tk.Frame(self._player_body, bg=BG_CARD)
+        scrub.pack(fill="x", padx=6, pady=(0, 4))
+        self._player_pos_var = tk.DoubleVar(value=0.0)
+        self._player_scale = ttk.Scale(
+            scrub, from_=0.0, to=1.0,
+            variable=self._player_pos_var, orient="horizontal",
+            command=self._on_player_scrub)
+        self._player_scale.pack(side="left", fill="x", expand=True)
+        self._player_time_lbl = tk.Label(
+            scrub, text="—", bg=BG_CARD, fg=TEXT_SEC,
+            font=FL, width=10, anchor="e")
+        self._player_time_lbl.pack(side="right", padx=(4, 0))
+
+        self._refresh_player_shot_list()
 
     def _make_tog_btn(self, parent, text, var, col):
         """Create a toggle button that actually works — no closure bug."""
         def toggle():
             var.set(not var.get())
-            btn.config(
-                bg=col    if var.get() else BG_CARD,
-                fg=BG_DARK if var.get() else TEXT_SEC)
+            _set_toggle(btn, var.get(), accent_color=col)
             self._redraw()
-        btn = tk.Button(parent, text=text, command=toggle,
-                        bg=col    if var.get() else BG_CARD,
-                        fg=BG_DARK if var.get() else TEXT_SEC,
-                        font=FL, relief="flat", bd=0,
-                        padx=6, pady=4, cursor="hand2")
+        btn = _mk_toggle(parent, text, var.get(), toggle, accent_color=col)
         return btn
-
-    # =========================================================================
-    # SERIES PICKER
-    # =========================================================================
-
     def _populate_series_picker(self):
         """Build the day + series dropdowns from live session and saved files."""
-        from core.session import load_session_history
         save_dir = (self.cfg.get("save_directory") or "").strip() or _default_save_dir()
         save_dir = os.path.abspath(save_dir)
 
@@ -3558,7 +3795,6 @@ class SeriesReviewWindow(tk.Toplevel):
             self._view_lbl.config(text="● LIVE" if self._is_live else "○ Past",
                                    fg=ACCENT if self._is_live else TEXT_DIM)
         else:
-            from core.session import Session, Shot, reconstruct_shot_traces
             raw_shots = entry["raw_shots"]
             traces    = reconstruct_shot_traces({"shots": raw_shots})
             fake_sess = Session(entry["history"]["name"])
@@ -3581,13 +3817,9 @@ class SeriesReviewWindow(tk.Toplevel):
             self._view_lbl.config(text="○ Saved", fg=TEXT_DIM)
 
         self._rebuild_shot_list()
+        self._refresh_player_shot_list()
         self._update_stats()
         self._redraw()
-
-    # =========================================================================
-    # SHOT LIST
-    # =========================================================================
-
     def _rebuild_shot_list(self):
         """Rebuild the per-shot checkbox rows for the current view."""
         for w in self._list_inner.winfo_children():
@@ -3629,11 +3861,9 @@ class SeriesReviewWindow(tk.Toplevel):
 
             # Delete button — only for live editable sessions
             if self._is_live:
-                tk.Button(row, text="✕",
-                          command=lambda s=shot: self._delete_shot(s),
-                          bg=BG_DARK, fg=ACCENT2,
-                          font=("Consolas", 9), relief="flat", bd=0,
-                          padx=3, cursor="hand2").pack(side="right")
+                _mk_chip(row, "✕",
+                         lambda s=shot: self._delete_shot(s)
+                         ).pack(side="right")
 
     def _on_shot_toggle(self, shot, var):
         shot.deleted = not var.get()
@@ -3661,13 +3891,7 @@ class SeriesReviewWindow(tk.Toplevel):
                 self._shot_chk_vars[shot.index].set(value)
         self._update_stats()
         self._redraw()
-
-    # =========================================================================
-    # RENDERER
-    # =========================================================================
-
     def _init_renderer(self):
-        from core.target_renderer import TargetRenderer
         w = self._canvas.winfo_width()
         h = self._canvas.winfo_height()
         if w < 50 or h < 50:
@@ -3681,7 +3905,6 @@ class SeriesReviewWindow(tk.Toplevel):
         self._populate_series_picker()
 
     def _on_canvas_resize(self, event):
-        from core.target_renderer import TargetRenderer
         if event.width < 50 or event.height < 50:
             return
         cal = float(self.cfg.get("shot_circle_calibre_mm",
@@ -3698,21 +3921,23 @@ class SeriesReviewWindow(tk.Toplevel):
         import cv2
         from PIL import Image, ImageTk
 
-        visible = [s for s in self._view_session.shots
-                   if s.series == self._view_series and not s.deleted]
-
-        img = self._renderer.render(
-            shots=visible,
-            show_mpi=self._show_group.get(),
-            show_group=self._show_group.get(),
-            current_series=self._view_series,
-            show_acp=self._show_acp.get(),
-            show_traces=self._show_traces.get(),
-            show_bbox_shots=self._show_bbox_s.get(),
-            show_bbox_acp=self._show_bbox_a.get(),
-            show_dot_only=self._dot_only.get(),
-            trace_alpha=1.0,  # full brightness in review
-        )
+        if self._player_mode and self._player_shot is not None:
+            img = self._render_player_frame()
+        else:
+            visible = [s for s in self._view_session.shots
+                       if s.series == self._view_series and not s.deleted]
+            img = self._renderer.render(
+                shots=visible,
+                show_mpi=self._show_group.get(),
+                show_group=self._show_group.get(),
+                current_series=self._view_series,
+                show_acp=self._show_acp.get(),
+                show_traces=self._show_traces.get(),
+                show_bbox_shots=self._show_bbox_s.get(),
+                show_bbox_acp=self._show_bbox_a.get(),
+                show_dot_only=self._dot_only.get(),
+                trace_alpha=1.0,  # full brightness in review
+            )
         photo = ImageTk.PhotoImage(
             Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
         if self._tgt_img_id is None:
@@ -3722,10 +3947,201 @@ class SeriesReviewWindow(tk.Toplevel):
             self._canvas.itemconfig(self._tgt_img_id, image=photo)
         self._canvas._img = photo
 
-    # =========================================================================
-    # STATS
-    # =========================================================================
+    def _toggle_player_mode(self):
+        """Switch between checkbox-driven view and single-shot replay."""
+        self._player_mode = not self._player_mode
+        if self._player_mode:
+            self._player_body.pack(fill="x", padx=0, pady=(0, 4))
+            self._player_mode_btn.configure(text="Play mode: ON")
+            self._refresh_player_shot_list()
+        else:
+            self._player_stop()
+            self._player_body.pack_forget()
+            self._player_mode_btn.configure(text="Play mode: OFF")
+        self._redraw()
 
+    def _refresh_player_shot_list(self):
+        """Refill the shot picker for the currently selected series."""
+        shots = [s for s in self._view_session.shots
+                 if s.series == self._view_series
+                 and s.trace and len(s.trace.points) >= 2]
+        labels = [self._player_shot_label(s) for s in shots]
+        self._player_shot_combo["values"] = labels
+        self._player_shot_indices = {
+            label: s for label, s in zip(labels, shots)
+        }
+        if not labels:
+            self._player_stop()
+            self._player_shot = None
+            self._player_shot_var.set("")
+            self._player_time_lbl.config(text="—")
+            self._player_scale.configure(to=1.0)
+            self._player_pos_var.set(0.0)
+            return
+        # Keep the current selection if still valid; otherwise pick the
+        # first available shot.
+        current = self._player_shot_var.get()
+        if current not in self._player_shot_indices:
+            self._player_shot_var.set(labels[0])
+        self._on_player_shot_selected()
+
+    @staticmethod
+    def _player_shot_label(shot: Shot) -> str:
+        score = shot.score
+        sc = f"{score:.1f}" if score != int(score) else str(int(score))
+        return f"#{shot.index}  {sc} pts"
+
+    def _on_player_shot_selected(self, _event=None):
+        label = self._player_shot_var.get()
+        shot = self._player_shot_indices.get(label)
+        if shot is None:
+            return
+        self._player_stop()
+        self._player_shot = shot
+        duration = self._player_duration(shot.trace)
+        self._player_scale.configure(to=max(duration, 0.001))
+        self._player_pos = 0.0
+        self._player_pos_var.set(0.0)
+        self._update_player_time_label()
+        self._redraw()
+
+    @staticmethod
+    def _player_duration(trace: ShotTrace) -> float:
+        pts = trace.points
+        if len(pts) < 2:
+            return 0.0
+        return max(0.0, pts[-1].timestamp - pts[0].timestamp)
+
+    def _on_player_speed(self, _event=None):
+        text = self._player_speed_var.get().rstrip("×")
+        try:
+            self._player_speed = float(text)
+        except ValueError:
+            self._player_speed = 1.0
+
+    def _on_player_scrub(self, _value=None):
+        if self._player_shot is None:
+            return
+        # Scrubbing implicitly pauses playback so the slider drives the
+        # playhead directly without fighting the timer.
+        if self._player_playing:
+            self._player_stop()
+        self._player_pos = float(self._player_pos_var.get())
+        self._update_player_time_label()
+        self._redraw()
+
+    def _player_toggle_play(self):
+        if self._player_shot is None:
+            return
+        if self._player_playing:
+            self._player_stop()
+            return
+        # If the playhead is at the end, restart from zero.
+        duration = self._player_duration(self._player_shot.trace)
+        if self._player_pos >= duration - 1e-3:
+            self._player_pos = 0.0
+            self._player_pos_var.set(0.0)
+        self._player_playing = True
+        self._player_play_btn.configure(text="❙❙")
+        self._player_last_tick = time.monotonic()
+        self._player_tick()
+
+    def _player_stop(self):
+        self._player_playing = False
+        if self._player_after_id is not None:
+            try:
+                self.after_cancel(self._player_after_id)
+            except Exception:
+                pass
+            self._player_after_id = None
+        if hasattr(self, "_player_play_btn"):
+            self._player_play_btn.configure(text="▶")
+
+    def _player_reset(self):
+        self._player_stop()
+        self._player_pos = 0.0
+        self._player_pos_var.set(0.0)
+        self._update_player_time_label()
+        self._redraw()
+
+    def _player_tick(self):
+        if not self._player_playing or self._player_shot is None:
+            return
+        now = time.monotonic()
+        dt = (now - self._player_last_tick) * self._player_speed
+        self._player_last_tick = now
+        self._player_pos += dt
+        duration = self._player_duration(self._player_shot.trace)
+        if self._player_pos >= duration:
+            self._player_pos = duration
+            self._player_pos_var.set(self._player_pos)
+            self._update_player_time_label()
+            self._redraw()
+            self._player_stop()
+            return
+        self._player_pos_var.set(self._player_pos)
+        self._update_player_time_label()
+        self._redraw()
+        self._player_after_id = self.after(33, self._player_tick)
+
+    def _update_player_time_label(self):
+        if self._player_shot is None:
+            self._player_time_lbl.config(text="—")
+            return
+        duration = self._player_duration(self._player_shot.trace)
+        self._player_time_lbl.config(
+            text=f"{self._player_pos:4.1f} / {duration:4.1f}s")
+
+    def _truncated_trace(self) -> ShotTrace:
+        """Return a trace clipped to the current playhead position."""
+        src = self._player_shot.trace
+        pts = src.points
+        if not pts:
+            return src
+        cutoff = pts[0].timestamp + self._player_pos
+        # Walk the trace and keep points up to the cutoff. The traces
+        # are stored in capture order, so a linear scan is fine; for
+        # very long traces this could be replaced with bisect.
+        kept = []
+        for p in pts:
+            if p.timestamp > cutoff:
+                break
+            kept.append(p)
+        if not kept:
+            kept = [pts[0]]
+        out = ShotTrace(points=kept,
+                         fired_time=src.fired_time,
+                         state=src.state)
+        out.cached_colours = src.cached_colours[:len(kept)]
+        out._cache_params = src._cache_params
+        return out
+
+    def _render_player_frame(self):
+        """Render the target showing only the player's truncated trace."""
+        shot = self._player_shot
+        trace = self._truncated_trace()
+        # Show the shot hole only once playback reaches the firing
+        # moment; before that the shot hasn't happened yet.
+        duration = self._player_duration(shot.trace)
+        reached_fire = self._player_pos >= duration - 1e-3
+        shots_to_render = [shot] if reached_fire else []
+
+        live_aim = trace.points[-1].aim_mm if trace.points else None
+
+        return self._renderer.render(
+            shots=shots_to_render,
+            highlighted_shot_trace=trace,
+            live_aim_mm=live_aim,
+            show_mpi=False,
+            show_group=False,
+            current_series=self._view_series,
+            show_acp=False,
+            show_traces=False,
+            show_bbox_shots=False,
+            show_bbox_acp=False,
+            show_dot_only=self._dot_only.get(),
+            trace_alpha=1.0,
+        )
     def _update_stats(self):
         visible = [s for s in self._view_session.shots
                    if s.series == self._view_series
@@ -3740,7 +4156,6 @@ class SeriesReviewWindow(tk.Toplevel):
                 v.config(text="—", fg=TEXT_SEC)
             return
 
-        import numpy as np
         coords = np.array([s.aim_mm for s in visible])
         radii  = np.sqrt(coords[:,0]**2 + coords[:,1]**2)
         score  = sum(s.score for s in visible)
@@ -3778,11 +4193,6 @@ class SeriesReviewWindow(tk.Toplevel):
             text=f"#{best.index} {best.score:.1f}", fg=GOLD)
         self._stat_lbls["worst"].config(
             text=f"#{worst.index} {worst.score:.1f}", fg=ACCENT2)
-
-    # =========================================================================
-    # ACTIONS
-    # =========================================================================
-
     def _next_series(self):
         if self.on_next_series:
             self.on_next_series()
@@ -3800,6 +4210,7 @@ class SeriesReviewWindow(tk.Toplevel):
             self._view_session.save_csv(out)
 
     def _on_close(self):
+        self._player_stop()
         if self.on_close_refresh:
             self.on_close_refresh()
         self.destroy()
