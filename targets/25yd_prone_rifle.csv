@@ -1,0 +1,18 @@
+# Splatt2 Target Definition — 25 Yard Prone Short Range Rifle (NSRA 2510 BM/89-18)
+# Outward gauging, .22 calibre. Card is solid black; bull_dia_mm=0
+# tells the renderer to skip the white aiming bull entirely.
+key,25yd_prone_rifle
+name,25yd Prone Rifle (NSRA 2510 BM/89-18)
+gauging,outward
+calibre_mm,5.6
+reference_dist_m,22.86
+aiming_mark_dia_mm,51.5
+card_diameter_mm,51.5
+bull_dia_mm,0
+
+score,ring_diameter_mm
+10,13.0
+9,20.0
+8,27.5
+7,34.5
+6,41.5
