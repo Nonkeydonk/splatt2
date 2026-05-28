@@ -336,7 +336,7 @@ class SplattApp:
         tk.Label(zf, text="ZOOM", bg=BG_PANEL, fg=TEXT_DIM,
                  font=FL).pack(side="left")
         self._cam_zoom_var = tk.DoubleVar(value=self._cam_zoom)
-        ttk.Scale(zf, from_=1.0, to=4.0, variable=self._cam_zoom_var,
+        ttk.Scale(zf, from_=1.0, to=8.0, variable=self._cam_zoom_var,
                   orient="horizontal", length=140,
                   command=self._on_cam_zoom_change).pack(side="left", padx=4)
         self._cam_zoom_lbl = tk.Label(
