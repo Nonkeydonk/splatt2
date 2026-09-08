@@ -160,7 +160,19 @@ DEFAULT_CONFIG = {
     "scoring_calibre_mm":      4.5,          # pellet diameter for scoring geometry (.177=4.5 .22=5.6)
     "decimal_scoring":         False,        # ISSF decimal scoring mode
     "ignore_misses":           False,        # discard shots scoring 0
-
+    
+    # ── Target appearance ────────────────────────────────────────────────────
+    "target_inner_rings":        5,          # rings using the inner colour; 0 = none
+    "target_score_rings": 5,       # label this many rings from inside out; 0 = none
+    "target_score_top": False,     # show scores above centre
+    "target_score_right": True,    # show scores right of centre
+    "target_score_bottom": False,  # show scores below centre
+    "target_score_left": False,    # show scores left of centre
+    "colour_target_outer":       "#fbe2a9",  # outer target fill: cream
+    "colour_target_inner":       "#0f0f0f",  # inner target fill: near-black
+    "colour_target_outer_lines": "#000000",  # lines and numbers on outer fill
+    "colour_target_inner_lines": "#ffffff",  # lines and numbers on inner fill
+    
     # ── Camera ───────────────────────────────────────────────────────────────
     "camera_index":    0,
     "video_width":     640,
@@ -237,6 +249,14 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r") as f:
                 saved = json.load(f)
+            # Migrate legacy target appearance names; explicit new keys win.
+            for old, new in {
+                "target_black_rings": "target_inner_rings",
+                "colour_target_paper": "colour_target_outer",
+                "colour_target_black": "colour_target_inner",
+            }.items():
+                if old in saved:
+                    saved.setdefault(new, saved.pop(old))
             cfg.update(saved)
         except Exception:
             first_run = True  # corrupt config treated as first run

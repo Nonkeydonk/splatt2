@@ -9,6 +9,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 
 from core.session import Shot, ShotTrace
+from core.config import DEFAULT_CONFIG
 
 
 # ── Colour palette (BGR) ──────────────────────────────────────────────────────
@@ -41,6 +42,54 @@ class TargetRenderer:
         self.calibre_mm = display_calibre_mm or target_cfg.get("calibre_mm", 4.5)
         self.zoom = max(0.1, float(zoom))
         dc = display_cfg or {}
+        
+        # Target appearance — defaults are defined in config.py.
+        self.target_colours = {}
+        for name in ("outer", "inner", "outer_lines", "inner_lines"):
+            key = f"colour_target_{name}"
+            value = dc.get(key, DEFAULT_CONFIG[key])
+
+            try:
+                self.target_colours[name] = _hex_to_bgr(value)
+            except (AttributeError, TypeError, ValueError):
+                self.target_colours[name] = _hex_to_bgr(DEFAULT_CONFIG[key])
+
+        try:
+            count = int(dc.get(
+                "target_inner_rings",
+                DEFAULT_CONFIG["target_inner_rings"],
+            ))
+        except (TypeError, ValueError):
+            count = DEFAULT_CONFIG["target_inner_rings"]
+
+        self.inner_ring_count = max(
+            0, min(count, len(target_cfg["rings_mm"]))
+        )
+        
+        try:
+            count = int(dc.get(
+                "target_score_rings",
+                DEFAULT_CONFIG["target_score_rings"],
+            ))
+        except (TypeError, ValueError):
+            count = DEFAULT_CONFIG["target_score_rings"]
+
+        self.score_ring_count = max(
+            0, min(count, len(target_cfg["rings_mm"]))
+        )
+
+        self.score_directions = []
+        for name, offset in [
+            ("top", (0, -1)),
+            ("right", (1, 0)),
+            ("bottom", (0, 1)),
+            ("left", (-1, 0)),
+        ]:
+            key = f"target_score_{name}"
+            enabled = dc.get(key, DEFAULT_CONFIG[key])
+            if str(enabled).lower() == "true":
+                self.score_directions.append(offset)
+
         # Colours from display config (fall back to hardcoded defaults)
         self.C_shot_fill = _hex_to_bgr(dc.get("colour_shot_fill",  "#5050ff"))
         self.C_acp       = _hex_to_bgr(dc.get("colour_acp",        "#ffc800"))
@@ -171,23 +220,24 @@ class TargetRenderer:
         centres = [self.mm_to_px((mx, my)) for mx, my in mark_offsets] \
                   if mark_offsets else [(self.cx, self.cy)]
 
+        colours = self.target_colours
+
         for ci, (ocx, ocy) in enumerate(centres):
+            # Draw from outside to inside.
             for i in reversed(range(len(rings))):
                 r = self.radius_to_px(rings[i])
-                fill = (15, 15, 15) if i >= len(rings) - 4 else (240, 240, 240)
+                is_inner = i < self.inner_ring_count
+
+                fill = colours["inner" if is_inner else "outer"]
+                line = colours[
+                    "inner_lines" if is_inner else "outer_lines"
+                ]
+
                 cv2.circle(img, (ocx, ocy), r, fill, -1)
-                cv2.circle(img, (ocx, ocy), r, C_RING_OUTER, 1)
-                # Score labels only on first mark to avoid clutter
-                if ci == 0 and i < len(rings) - 1:
-                    sc  = scores[i]
-                    lbl = str(int(sc)) if sc == int(sc) else str(sc)
-                    tc  = (200, 200, 200) if i >= len(rings) - 4 else (80, 80, 80)
-                    mid_r = (rings[i] + (rings[i-1] if i > 0 else 0)) / 2
-                    lx = int(ocx + mid_r * self.scale * 0.6)
-                    cv2.putText(img, lbl, (lx, ocy + 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, tc, 1, cv2.LINE_AA)
-            cv2.circle(img, (ocx, ocy),
-                       max(2, self.radius_to_px(0.5)), (0, 0, 0), -1)
+                cv2.circle(
+                    img, (ocx, ocy), r, line, 1, cv2.LINE_AA
+                )
+
 
         # Crosshair lines across full canvas (only for single-mark targets)
         if not mark_offsets:
@@ -207,6 +257,42 @@ class TargetRenderer:
                     py = int(self.cy + approach_r * np.sin(a))
                     cv2.circle(img, (px, py), 1, (50, 50, 60), -1)
 
+        # Draw labels last so ring fills cannot cover them.
+        # Keep the existing behaviour: labels on the first mark only.
+        ocx, ocy = centres[0]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        for i in range(self.score_ring_count):
+            score = scores[i]
+            label = (
+                str(int(score))
+                if score == int(score)
+                else str(score)
+            )
+
+            inner_r = rings[i - 1] if i > 0 else 0.0
+            mid_r_px = (inner_r + rings[i]) * 0.5 * self.scale
+
+            colour = self.target_colours[
+                "inner_lines"
+                if i < self.inner_ring_count
+                else "outer_lines"
+            ]
+
+            font_scale = 0.35
+            (width, height), baseline = cv2.getTextSize(
+                label, font, font_scale, 1
+            )
+
+            for dx, dy in self.score_directions:
+                x = round(ocx + dx * mid_r_px - width / 2)
+                y = round(ocy + dy * mid_r_px + height / 2)
+
+                cv2.putText(
+                    img, label, (x, y),
+                    font, font_scale, colour, 1, cv2.LINE_AA,
+                )
+                
         return img
 
     # ── Drawing helpers ───────────────────────────────────────────────────────
