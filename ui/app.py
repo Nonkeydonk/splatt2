@@ -1481,7 +1481,13 @@ class SplattApp:
                 "colour_shot_fill","colour_acp","colour_crosshair",
                 "colour_mpi","colour_group","colour_miss",
                 "trace_width","fading_trace_duration_s",
-                "trace_preshot_s","trace_final_s"]
+                "trace_preshot_s","trace_final_s",
+                "target_inner_rings","colour_target_outer",
+                "colour_target_inner","colour_target_outer_lines",
+                "colour_target_inner_lines","target_score_rings",
+                "target_score_top","target_score_right",
+                "target_score_bottom","target_score_left"
+                ]
         return {k: self.cfg[k] for k in keys if k in self.cfg}
 
     def _open_series_tab(self):
@@ -2448,7 +2454,7 @@ class SessionHistoryWindow(tk.Toplevel):
             self.after(100, self._init_renderer)
             return
         tkey = self.cfg.get("target_key", "10m_air_rifle")
-        self._renderer = TargetRenderer((w, h), TARGETS[tkey])
+        self._renderer = TargetRenderer((w, h), TARGETS[tkey], display_cfg=self.cfg)
         self._redraw()
 
     def _load(self):
@@ -2968,6 +2974,23 @@ class SettingsDialog(tk.Toplevel):
                   bg=BG_CARD, fg=TEXT_DIM, font=FL, relief="flat",
                   padx=6, pady=3, cursor="hand2").pack(side="left", padx=2)
         tk.Frame(tab, bg=BG_DARK, height=16).pack()
+        
+        self._section(tab, "Ring Scores")
+        self._row(
+            tab, "Number lables from inside",
+            lambda p: self._entry(p, "target_score_rings", 5),
+        )
+        for key, label in [
+            ("target_score_top", "Show scores: top"),
+            ("target_score_right", "Show scores: right"),
+            ("target_score_bottom", "Show scores: bottom"),
+            ("target_score_left", "Show scores: left"),
+        ]:
+            self._row(
+                tab, label,
+                lambda p, k=key: self._combo(p, k, ["False", "True"]),
+            )
+        
 
     # ── Collect / Apply ───────────────────────────────────────────────────────
 
@@ -2996,6 +3019,21 @@ class SettingsDialog(tk.Toplevel):
         ]:
             self._colour_row(tab, label, key)
 
+        self._section(tab, "Target Appearance")
+        self._row(
+            tab,
+            "Inner-colour rings",
+            lambda p: self._entry(p, "target_inner_rings", 5),
+        )
+
+        for key, label in [
+            ("colour_target_outer",       "Outer colour"),
+            ("colour_target_inner",       "Inner colour"),
+            ("colour_target_outer_lines", "Outer line colour"),
+            ("colour_target_inner_lines", "Inner line colour"),
+        ]:
+            self._colour_row(tab, label, key)
+            
         self._section(tab, "Trace Appearance")
         r = tk.Frame(tab, bg=BG_DARK); r.pack(fill="x", padx=12, pady=4)
         tk.Label(r, text="Trace line width:", bg=BG_DARK, fg=TEXT_SEC,
