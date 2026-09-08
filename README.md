@@ -191,6 +191,11 @@ Left to right: Pause, Zero, Fine Zero, decimal scoring toggle (DEC), camera rota
 | Shot circle dia | Visual size of the shot hole on screen (cosmetic only) |
 | Zero offset | Current persistent zero — reset here if needed |
 | Ignore misses | Discard score-0 shots from statistics (useful in competition training) |
+| Inner-colour rings | Number of innermost rings using the inner fill. `0` uses the outer fill throughout. |
+| Inner colour | Fill for the inner rings. |
+| Outer colour | Fill for the remaining rings. |
+| Inner line colour | Ring outlines and score labels on the inner fill. |
+| Outer line colour | Ring outlines and score labels on the outer fill. |
 
 ### Colours
 All trace and shot colours are fully configurable. Changes apply on **Apply** without restarting.
